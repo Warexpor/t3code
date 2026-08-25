@@ -42,20 +42,27 @@ import {
 } from "./use-thread-settings-sheet-presentation";
 
 import { makeTurnCommandMetadata } from "../../lib/commandMetadata";
-import { convertPastedImagesToAttachments, pickComposerImages } from "../../lib/composerImages";
+import {
+  convertPastedImagesToAttachments,
+  pickComposerFiles,
+  pickComposerImages,
+} from "../../lib/composerImages";
 import { useScaledTextRole } from "../settings/appearance/useScaledTextRole";
 import {
   clearComposerDraftContent,
+  flushComposerDrafts,
   getComposerDraftSnapshot,
   mergeComposerDraftContent,
   restoreComposerDraftSnapshot,
+  scheduleUnusedComposerAttachmentCleanup,
   type ComposerDraft,
 } from "../../state/use-composer-drafts";
 import { useEnvironmentServerConfig, useProjects } from "../../state/entities";
 import { resolveSelectableModelSelection } from "../../lib/modelOptions";
 import { deriveThreadTitleFromPrompt } from "../../lib/projectThreadStartTurn";
 import { armAgentAwarenessLiveActivityForLocalWork } from "../agent-awareness/remoteRegistration";
-import { enqueueThreadOutboxMessage, removeThreadOutboxMessage } from "../../state/thread-outbox";
+import { enqueueThreadOutboxMessage } from "../../state/thread-outbox";
+import { removeThreadOutboxMessage } from "../../state/thread-outbox-removal";
 import { useRemoteConnectionStatus } from "../../state/use-remote-environment-registry";
 import { useNewTaskFlow } from "./new-task-flow-provider";
 import { resolveProjectThreadCreationBranch } from "./projectThreadCreationValidation";
@@ -66,6 +73,7 @@ import {
   resolveNewTaskWorkspaceLabel,
 } from "./new-task-context-presentation";
 import { useIncomingShare } from "../sharing/IncomingShareProvider";
+import { selectIncomingShareAttachments } from "../sharing/incoming-share-model";
 
 function NewTaskWorkspaceIcon(props: {
   readonly workspaceMode: "local" | "worktree";
@@ -215,9 +223,18 @@ export function NewTaskDraftScreen(props: {
   );
   const isProjectPickerReturnActive =
     isReturningToProjectPicker && !requestedInitialProjectAvailable;
-  const isIncomingShareTransferPending = Boolean(
-    incomingShare && cancelledIncomingShareId !== props.incomingShareId,
+  const isIncomingShareAwaitingServerConfig = Boolean(
+    incomingShare?.attachments.some((attachment) => attachment.type === "file") &&
+    selectedEnvironmentServerConfig === null,
   );
+  const isIncomingShareTransferPending = Boolean(
+    incomingShare &&
+    cancelledIncomingShareId !== props.incomingShareId &&
+    !isIncomingShareAwaitingServerConfig,
+  );
+  const isComposerInteractionLocked = isIncomingShareTransferPending || flow.submitting;
+  // Also guard while a submit is in flight: an Android back press or iOS
+  // Cancel would otherwise abandon the screen while the task still starts.
   const composerMenu = useComposerCommandMenu({
     draftMessage: flow.prompt,
     environmentId: selectedProject?.environmentId ?? null,
@@ -227,12 +244,14 @@ export function NewTaskDraftScreen(props: {
         : (flow.selectedWorktreePath ?? selectedProject?.workspaceRoot)) || null,
     selectedProviderStatus: flow.selectedProviderStatus,
     hasThread: false,
-    enabled: isComposerFocused && !isIncomingShareTransferPending,
+    enabled: isComposerFocused && !isComposerInteractionLocked,
     onChangeDraftMessage: flow.setPrompt,
     onUpdateInteractionMode: flow.planModeEnabled ? flow.setInteractionMode : undefined,
   });
   usePreventRemove(
-    (isIncomingShareTransferPending && !isProjectPickerReturnActive) || isCancellingShareImport,
+    (isIncomingShareTransferPending && !isProjectPickerReturnActive) ||
+      isCancellingShareImport ||
+      flow.submitting,
     () => undefined,
   );
   const hasImportedIncomingShare = Boolean(
@@ -446,6 +465,13 @@ export function NewTaskDraftScreen(props: {
       return;
     }
 
+    if (
+      incomingShare.attachments.some((attachment) => attachment.type === "file") &&
+      selectedEnvironmentServerConfig === null
+    ) {
+      return;
+    }
+
     if (alertedUnavailableIncomingShareIdRef.current === shareId) {
       alertedUnavailableIncomingShareIdRef.current = null;
     }
@@ -459,6 +485,12 @@ export function NewTaskDraftScreen(props: {
     activeShareImportTokenRef.current = importToken;
     setImportingShareKey(importKey);
     void (async () => {
+      const selectedAttachments = selectIncomingShareAttachments({
+        attachments: incomingShare.attachments,
+        maxFileAttachmentBytes:
+          selectedEnvironmentServerConfig?.environment.capabilities.fileAttachments
+            ?.maxUploadBytes ?? null,
+      });
       await reserveShare(shareId, {
         environmentId: String(destinationProject.environmentId),
         projectId: String(destinationProject.id),
@@ -475,7 +507,7 @@ export function NewTaskDraftScreen(props: {
       needsDraftRestore = true;
       const { skippedAttachmentCount } = await mergeComposerDraftContent(draftKey, {
         text: incomingShare.text,
-        attachments: incomingShare.attachments,
+        attachments: selectedAttachments.attachments,
         sourceShareId: shareId,
       });
       if (
@@ -492,10 +524,17 @@ export function NewTaskDraftScreen(props: {
       if (!shareImportMountedRef.current || activeShareImportTokenRef.current !== importToken) {
         return;
       }
-      const warnings = [...incomingShare.warnings];
+      const retainedAttachmentIds = new Set(
+        getComposerDraftSnapshot(draftKey).attachments.map((attachment) => attachment.id),
+      );
+      const rejectedAttachments = incomingShare.attachments.filter(
+        (attachment) => !retainedAttachmentIds.has(attachment.id),
+      );
+      scheduleUnusedComposerAttachmentCleanup(rejectedAttachments);
+      const warnings = [...incomingShare.warnings, ...selectedAttachments.warnings];
       if (skippedAttachmentCount > 0) {
         warnings.push(
-          `${skippedAttachmentCount} shared image${skippedAttachmentCount === 1 ? " was" : "s were"} skipped because this draft reached the attachment limit.`,
+          `${skippedAttachmentCount} shared file${skippedAttachmentCount === 1 ? " was" : "s were"} skipped because this draft reached the attachment limit.`,
         );
       }
       if (warnings.length > 0) {
@@ -602,6 +641,7 @@ export function NewTaskDraftScreen(props: {
     props.initialProjectRef?.projectId,
     releaseShareReservation,
     reserveShare,
+    selectedEnvironmentServerConfig,
     selectedProject,
     shareImportAttempt,
   ]);
@@ -633,12 +673,34 @@ export function NewTaskDraftScreen(props: {
   const showBranchLoading = flow.branchesLoading && flow.availableBranches.length === 0;
 
   async function handlePickImages(): Promise<void> {
-    if (isIncomingShareTransferPending) {
+    if (isComposerInteractionLocked) {
       return;
     }
     const result = await pickComposerImages({ existingCount: flow.attachments.length });
     if (result.images.length > 0) {
       flow.appendAttachments(result.images);
+    }
+  }
+
+  async function handlePickFiles(): Promise<void> {
+    if (isComposerInteractionLocked) {
+      return;
+    }
+    const maxBytes =
+      selectedEnvironmentServerConfig?.environment.capabilities.fileAttachments?.maxUploadBytes;
+    if (maxBytes === undefined) {
+      Alert.alert("File attachments are not available on this server.");
+      return;
+    }
+    const result = await pickComposerFiles({
+      existingCount: flow.attachments.length,
+      maxBytes,
+    });
+    if (result.files.length > 0) {
+      flow.appendAttachments(result.files);
+    }
+    if (result.error) {
+      Alert.alert("Could not attach file", result.error);
     }
   }
 
@@ -764,6 +826,10 @@ export function NewTaskDraftScreen(props: {
       interactionMode,
       initialMessageText,
       initialAttachments: draft.attachments,
+      onAttachmentsUploaded: async (attachments) => {
+        flow.replaceAttachments(attachments);
+        await flushComposerDrafts();
+      },
       ...(editingPendingTask
         ? {
             turnMetadata: {
@@ -839,7 +905,7 @@ export function NewTaskDraftScreen(props: {
       // The context-first screen intentionally opens with the keyboard closed.
       // Focusing is a user action, so presenting the form sheet has one motion.
       autoFocus={false}
-      editable={!isIncomingShareTransferPending}
+      editable={!isComposerInteractionLocked}
       multiline
       scrollEnabled
       value={flow.prompt}
@@ -873,7 +939,7 @@ export function NewTaskDraftScreen(props: {
     navigation.goBack();
   };
   const chooseProject = () => {
-    if (isIncomingShareTransferPending) {
+    if (isComposerInteractionLocked) {
       return;
     }
     promptInputRef.current?.blur();
@@ -881,7 +947,7 @@ export function NewTaskDraftScreen(props: {
     navigation.dispatch(StackActions.push("NewTask", { incomingShareId: props.incomingShareId }));
   };
   const openContextPicker = (routeName: "NewTaskBranch" | "NewTaskEnvironment") => {
-    if (isIncomingShareTransferPending) {
+    if (isComposerInteractionLocked) {
       return;
     }
     promptInputRef.current?.blur();
@@ -901,7 +967,7 @@ export function NewTaskDraftScreen(props: {
             accessibilityHint="Opens the project picker"
             accessibilityLabel={`Change project from ${selectedProject.title}`}
             accessibilityRole="button"
-            disabled={isIncomingShareTransferPending}
+            disabled={isComposerInteractionLocked}
             onPress={chooseProject}
             className="min-w-0 max-w-[250px] border-b border-foreground-muted active:opacity-65"
           >
@@ -919,7 +985,7 @@ export function NewTaskDraftScreen(props: {
       <ComposerInlineControl
         accessibilityLabel={`Environment: ${selectedEnvironmentLabel}`}
         chevronDirection="right"
-        disabled={isIncomingShareTransferPending}
+        disabled={isComposerInteractionLocked}
         icon="desktopcomputer"
         label={`on ${selectedEnvironmentLabel}`}
         maxWidth={260}
@@ -954,7 +1020,7 @@ export function NewTaskDraftScreen(props: {
       <ComposerInlineControl
         accessibilityHint={`Switches to ${flow.workspaceMode === "local" ? "a new worktree" : "the current checkout"}`}
         accessibilityLabel={workspaceLabel}
-        disabled={isIncomingShareTransferPending}
+        disabled={isComposerInteractionLocked}
         iconNode={
           <NewTaskWorkspaceIcon
             workspaceMode={flow.workspaceMode}
@@ -970,7 +1036,7 @@ export function NewTaskDraftScreen(props: {
       <ComposerInlineControl
         accessibilityLabel={`${flow.workspaceMode === "worktree" ? "Base branch" : "Branch"}: ${selectedBranchLabel}`}
         chevronDirection="right"
-        disabled={isIncomingShareTransferPending}
+        disabled={isComposerInteractionLocked}
         icon="arrow.triangle.branch"
         label={showBranchLoading ? "Loading branches…" : selectedBranchLabel}
         maxWidth={190}
@@ -1010,7 +1076,7 @@ export function NewTaskDraftScreen(props: {
               attachments={flow.attachments}
               imageBorderRadius={16}
               imageSize={72}
-              onRemove={isIncomingShareTransferPending ? () => undefined : flow.removeAttachment}
+              onRemove={isComposerInteractionLocked ? () => undefined : flow.removeAttachment}
             />
           </View>
         ) : null}
@@ -1021,14 +1087,24 @@ export function NewTaskDraftScreen(props: {
           <ComposerToolbarScroller contentPaddingRight={8} fadeSurface="sheet">
             <ComposerToolbarButton
               accessibilityLabel="Add attachment"
-              disabled={isIncomingShareTransferPending}
+              disabled={isComposerInteractionLocked}
               icon="plus"
-              onPress={() => void handlePickImages()}
+              onPress={() => {
+                if (selectedEnvironmentServerConfig?.environment.capabilities.fileAttachments) {
+                  Alert.alert("Add attachment", undefined, [
+                    { text: "Photos", onPress: () => void handlePickImages() },
+                    { text: "Files", onPress: () => void handlePickFiles() },
+                    { text: "Cancel", style: "cancel" },
+                  ]);
+                  return;
+                }
+                void handlePickImages();
+              }}
               showChevron={false}
             />
             <ComposerInlineControl
               accessibilityLabel="Model and reasoning settings"
-              disabled={isIncomingShareTransferPending}
+              disabled={isComposerInteractionLocked}
               emphasized
               iconNode={
                 <ProviderIcon provider={flow.selectedModelOption?.providerDriver} size={16} />
@@ -1041,7 +1117,7 @@ export function NewTaskDraftScreen(props: {
               <ComposerInlineControl
                 accessibilityHint={`Switches to ${flow.interactionMode === "plan" ? "Build" : "Plan"} mode`}
                 accessibilityLabel={`Interaction mode: ${flow.interactionMode === "plan" ? "Plan" : "Build"}`}
-                disabled={isIncomingShareTransferPending}
+                disabled={isComposerInteractionLocked}
                 emphasized
                 icon={
                   flow.interactionMode === "plan"
