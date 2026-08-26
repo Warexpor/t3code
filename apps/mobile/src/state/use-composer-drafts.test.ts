@@ -6,7 +6,7 @@ import {
   ProviderInstanceId,
   ThreadId,
 } from "@t3tools/contracts";
-import { vi } from "vite-plus/test";
+import { onTestFinished, vi } from "vite-plus/test";
 
 const composerDraftFileMocks = vi.hoisted(() => {
   let document = "";
@@ -238,6 +238,8 @@ describe("mobile composer drafts", () => {
   });
 
   it("keeps shared attachment files until every draft releases them", async () => {
+    const outboxLoad = vi.spyOn(threadOutboxManager, "load").mockResolvedValue(true);
+    onTestFinished(() => outboxLoad.mockRestore());
     const file = {
       id: "file-1",
       type: "file" as const,
@@ -316,6 +318,7 @@ describe("mobile composer drafts", () => {
           },
         ],
       });
+      return true;
     });
 
     try {
@@ -960,6 +963,8 @@ describe("mobile composer drafts", () => {
   });
 
   it("spares a file re-owned between the sweep's scan and its deletion", async () => {
+    const outboxLoad = vi.spyOn(threadOutboxManager, "load").mockResolvedValue(true);
+    onTestFinished(() => outboxLoad.mockRestore());
     const fileFor = (id: string) => ({
       id,
       type: "file" as const,
