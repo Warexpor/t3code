@@ -692,8 +692,15 @@ export function NewTaskDraftScreen(props: {
       return;
     }
     const result = await pickComposerImages({ existingCount: flow.attachments.length });
-    if (result.images.length > 0) {
-      flow.appendAttachments(result.images);
+    const rejectedCount = result.images.length > 0 ? flow.appendAttachments(result.images) : 0;
+    const problems = [
+      ...(result.error ? [result.error] : []),
+      ...(rejectedCount > 0
+        ? [`You can attach up to ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS} attachments per message.`]
+        : []),
+    ];
+    if (problems.length > 0) {
+      Alert.alert("Could not attach photo", problems.join("\n\n"));
     }
   }
 

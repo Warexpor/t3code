@@ -167,7 +167,11 @@ export async function completeQueuedMessageDelivery(
   }
   try {
     // Removal also releases the message's local attachment files.
-    const removed = await removeThreadOutboxMessage(queuedMessage, deliveryRevision);
+    const removed = await removeThreadOutboxMessage(
+      queuedMessage,
+      deliveryRevision,
+      () => !appAtomRegistry.get(editingQueuedMessageIdsAtom)[queuedMessage.messageId],
+    );
     if (!removed) {
       console.warn(
         "[thread-outbox] delivered message was edited before cleanup; keeping the newer message",
@@ -254,7 +258,11 @@ export async function recoverEditedCreationAfterDelivery(
     return true;
   }
   try {
-    return await removeThreadOutboxMessage(kept, keptRevision);
+    return await removeThreadOutboxMessage(
+      kept,
+      keptRevision,
+      () => !appAtomRegistry.get(editingQueuedMessageIdsAtom)[kept.messageId],
+    );
   } catch (error) {
     console.warn("[thread-outbox] could not remove recovered pending task", error);
     return false;
@@ -352,7 +360,13 @@ export async function restoreRejectedQueuedMessage(
     }
     // Revision-checked: an edit that landed after the confirmation above
     // must not be deleted with the pre-edit payload this recovery restored.
-    if (!(await removeThreadOutboxMessage(queuedMessage, revision))) {
+    if (
+      !(await removeThreadOutboxMessage(
+        queuedMessage,
+        revision,
+        () => !appAtomRegistry.get(editingQueuedMessageIdsAtom)[queuedMessage.messageId],
+      ))
+    ) {
       await undoComposerDraftMerge(draftKey, originalDraft, restoredDraft);
       return "deferred";
     }

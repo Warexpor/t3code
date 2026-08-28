@@ -640,10 +640,65 @@ describe("thread outbox", () => {
   it("keeps a retry enqueued when its publish races a revision-checked removal", async () => {
     const registry = AtomRegistry.make();
     const stored = new Map<MessageId, QueuedThreadMessage>();
-    let resumeRemove: () => void = () => {};
-    const removeBarrier = new Promise<void>((resolve) => {
-      resumeRemove = resolve;
+    const removeStarted = Promise.withResolvers<void>();
+    const removeBarrier = Promise.withResolvers<void>();
+    const replacementWriteStarted = Promise.withResolvers<void>();
+    const replacementWriteBarrier = Promise.withResolvers<void>();
+    const original = queuedMessage({
+      messageId: "message-remove-enqueue-race",
+      createdAt: "2026-06-08T10:00:01.000Z",
     });
+    const retried = { ...original, text: "retried" };
+    const manager = createThreadOutboxManager({
+      registry,
+      storage: {
+        load: async () => [...stored.values()],
+        write: async (message) => {
+          if (message === retried) {
+            replacementWriteStarted.resolve();
+            await replacementWriteBarrier.promise;
+          }
+          stored.set(message.messageId, message);
+        },
+        remove: async (message) => {
+          removeStarted.resolve();
+          await removeBarrier.promise;
+          stored.delete(message.messageId);
+        },
+      },
+    });
+
+    await manager.enqueue(original);
+    const removal = manager.remove(original, manager.revisionOf(original.messageId));
+    let removalSettled = false;
+    void removal.then(() => {
+      removalSettled = true;
+    });
+    await removeStarted.promise;
+    // Published synchronously while the durable remove is still in flight.
+    const enqueue = manager.enqueue(retried);
+    removeBarrier.resolve();
+    await replacementWriteStarted.promise;
+
+    // The canceled removal itself restores the durable winner. The queued
+    // enqueue write has not had a chance to run yet.
+    expect(removalSettled).toBe(false);
+    replacementWriteBarrier.resolve();
+    await expect(removal).resolves.toBe(null);
+    expect(stored.get(original.messageId)).toEqual(retried);
+    await enqueue;
+    expect(registry.get(manager.queuedMessagesByThreadKeyAtom)).toEqual({
+      "environment-1:thread-1": [retried],
+    });
+    expect(stored.get(original.messageId)).toEqual(retried);
+    registry.dispose();
+  });
+
+  it("restores a message when its live removal predicate changes during storage removal", async () => {
+    const registry = AtomRegistry.make();
+    const stored = new Map<MessageId, QueuedThreadMessage>();
+    const removeStarted = Promise.withResolvers<void>();
+    const removeBarrier = Promise.withResolvers<void>();
     const manager = createThreadOutboxManager({
       registry,
       storage: {
@@ -652,29 +707,178 @@ describe("thread outbox", () => {
           stored.set(message.messageId, message);
         },
         remove: async (message) => {
-          await removeBarrier;
+          removeStarted.resolve();
+          await removeBarrier.promise;
           stored.delete(message.messageId);
         },
       },
     });
-    const original = queuedMessage({
-      messageId: "message-remove-enqueue-race",
+    const message = queuedMessage({
+      messageId: "message-remove-predicate-race",
       createdAt: "2026-06-08T10:00:01.000Z",
     });
-    const retried = { ...original, text: "retried" };
+    let canRemove = true;
 
-    await manager.enqueue(original);
-    const removal = manager.remove(original, manager.revisionOf(original.messageId));
-    // Published synchronously while the durable remove is still in flight.
-    const enqueue = manager.enqueue(retried);
-    resumeRemove();
+    await manager.enqueue(message);
+    const removal = manager.remove(message, manager.revisionOf(message.messageId), () => canRemove);
+    await removeStarted.promise;
+    canRemove = false;
+    removeBarrier.resolve();
 
     await expect(removal).resolves.toBe(null);
-    await enqueue;
     expect(registry.get(manager.queuedMessagesByThreadKeyAtom)).toEqual({
-      "environment-1:thread-1": [retried],
+      "environment-1:thread-1": [message],
     });
-    expect(stored.get(original.messageId)).toEqual(retried);
+    expect(stored.get(message.messageId)).toEqual(message);
+    registry.dispose();
+  });
+
+  it("preserves concurrent enqueues while clearing an environment", async () => {
+    const registry = AtomRegistry.make();
+    const stored = new Map<MessageId, QueuedThreadMessage>();
+    const removeStarted = Promise.withResolvers<void>();
+    const removeBarrier = Promise.withResolvers<void>();
+    const manager = createThreadOutboxManager({
+      registry,
+      storage: {
+        load: async () => [...stored.values()],
+        write: async (message) => {
+          stored.set(message.messageId, message);
+        },
+        remove: async (message) => {
+          if (message.environmentId === EnvironmentId.make("environment-clear")) {
+            removeStarted.resolve();
+            await removeBarrier.promise;
+          }
+          stored.delete(message.messageId);
+        },
+      },
+    });
+    const replaced = queuedMessage({
+      environmentId: "environment-clear",
+      messageId: "message-replaced-during-clear",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    const removed = queuedMessage({
+      environmentId: "environment-clear",
+      messageId: "message-removed-by-clear",
+      createdAt: "2026-06-08T10:00:02.000Z",
+    });
+    const kept = queuedMessage({
+      environmentId: "environment-keep",
+      messageId: "message-other-environment",
+      createdAt: "2026-06-08T10:00:03.000Z",
+    });
+    const replacement = { ...replaced, text: "replacement" };
+    const added = queuedMessage({
+      environmentId: "environment-clear",
+      messageId: "message-added-during-clear",
+      createdAt: "2026-06-08T10:00:04.000Z",
+    });
+
+    await Promise.all([manager.enqueue(replaced), manager.enqueue(removed), manager.enqueue(kept)]);
+    const clearing = manager.clearEnvironment(replaced.environmentId);
+    await removeStarted.promise;
+    const replacing = manager.enqueue(replacement);
+    const adding = manager.enqueue(added);
+    removeBarrier.resolve();
+
+    await expect(clearing).resolves.toEqual([removed]);
+    expect(registry.get(manager.queuedMessagesByThreadKeyAtom)).toEqual({
+      "environment-clear:thread-1": [replacement, added],
+      "environment-keep:thread-1": [kept],
+    });
+    expect(stored.get(replacement.messageId)).toEqual(replacement);
+    expect(stored.has(removed.messageId)).toBe(false);
+
+    await Promise.all([replacing, adding]);
+    expect([...stored.values()]).toEqual(expect.arrayContaining([replacement, added, kept]));
+    registry.dispose();
+  });
+
+  it("does not restore a message removed before a queued environment clear starts", async () => {
+    const registry = AtomRegistry.make();
+    const stored = new Map<MessageId, QueuedThreadMessage>();
+    const removeStarted = Promise.withResolvers<void>();
+    const removeBarrier = Promise.withResolvers<void>();
+    let removeCalls = 0;
+    const manager = createThreadOutboxManager({
+      registry,
+      storage: {
+        load: async () => [...stored.values()],
+        write: async (message) => {
+          stored.set(message.messageId, message);
+        },
+        remove: async (message) => {
+          removeCalls += 1;
+          if (removeCalls === 1) {
+            removeStarted.resolve();
+            await removeBarrier.promise;
+          }
+          stored.delete(message.messageId);
+        },
+      },
+    });
+    const message = queuedMessage({
+      environmentId: "environment-clear",
+      messageId: "message-removed-before-clear",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+
+    await manager.enqueue(message);
+    const removal = manager.remove(message);
+    await removeStarted.promise;
+    const clearing = manager.clearEnvironment(message.environmentId);
+    removeBarrier.resolve();
+
+    await expect(removal).resolves.toEqual(message);
+    await expect(clearing).resolves.toEqual([]);
+    expect(removeCalls).toBe(1);
+    expect(registry.get(manager.queuedMessagesByThreadKeyAtom)).toEqual({});
+    expect(stored.has(message.messageId)).toBe(false);
+    registry.dispose();
+  });
+
+  it("keeps an enqueue published while an environment clear waits to start", async () => {
+    const registry = AtomRegistry.make();
+    const stored = new Map<MessageId, QueuedThreadMessage>();
+    const mutationStarted = Promise.withResolvers<void>();
+    const mutationBarrier = Promise.withResolvers<void>();
+    let removeCalls = 0;
+    const manager = createThreadOutboxManager({
+      registry,
+      storage: {
+        load: async () => [...stored.values()],
+        write: async (message) => {
+          stored.set(message.messageId, message);
+        },
+        remove: async () => {
+          removeCalls += 1;
+        },
+      },
+    });
+    const blocker = manager.serialize(async () => {
+      mutationStarted.resolve();
+      await mutationBarrier.promise;
+    });
+    await mutationStarted.promise;
+    const clearing = manager.clearEnvironment(EnvironmentId.make("environment-clear"));
+    const added = queuedMessage({
+      environmentId: "environment-clear",
+      messageId: "message-enqueued-before-clear-start",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    const enqueue = manager.enqueue(added);
+    mutationBarrier.resolve();
+
+    await blocker;
+    await expect(clearing).resolves.toEqual([]);
+    expect(removeCalls).toBe(0);
+    expect(registry.get(manager.queuedMessagesByThreadKeyAtom)).toEqual({
+      "environment-clear:thread-1": [added],
+    });
+    await enqueue;
+    expect(stored.get(added.messageId)).toEqual(added);
     registry.dispose();
   });
 

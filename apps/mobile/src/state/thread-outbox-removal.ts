@@ -10,15 +10,16 @@ import { scheduleUnusedComposerAttachmentCleanup } from "./use-composer-drafts";
  * file still referenced by a draft or another queued message survives).
  * Keeping release inside the removal call means no call site can forget it.
  *
- * `expectedRevision` (from `threadOutboxRevision`) makes the removal a
- * compare-and-set: when an edit was accepted since the revision was read, the
- * newer message stays queued, nothing is released, and this returns false.
+ * `expectedRevision` (from `threadOutboxRevision`) and `canRemove` make the
+ * removal a compare-and-set: when an edit was accepted or an editor takes the
+ * message, it stays queued, nothing is released, and this returns false.
  */
 export async function removeThreadOutboxMessage(
   message: QueuedThreadMessage,
   expectedRevision?: number,
+  canRemove?: () => boolean,
 ): Promise<boolean> {
-  const removed = await threadOutboxManager.remove(message, expectedRevision);
+  const removed = await threadOutboxManager.remove(message, expectedRevision, canRemove);
   if (removed === null) {
     return false;
   }

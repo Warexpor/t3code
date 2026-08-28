@@ -6,6 +6,7 @@ const harness = vi.hoisted(() => ({
     typeof import("./thread-outbox-manager").createThreadOutboxManager
   >,
   removePersistedFile: vi.fn(async () => undefined),
+  removeOutboxMessage: vi.fn(async (_message: QueuedThreadMessage) => undefined),
   setPendingConnectionError: vi.fn(),
   draftFile: (() => {
     let document = "";
@@ -99,7 +100,7 @@ vi.mock("./thread-outbox", async () => {
     storage: {
       load: async () => [],
       write: async () => undefined,
-      remove: async () => undefined,
+      remove: (message) => harness.removeOutboxMessage(message),
     },
   });
   const manager = harness.manager;
@@ -165,6 +166,7 @@ afterEach(() => {
   appAtomRegistry.set(editingQueuedMessageIdsAtom, {});
   harness.draftFile.setWriteError(null);
   harness.removePersistedFile.mockClear();
+  harness.removeOutboxMessage.mockClear();
   harness.setPendingConnectionError.mockClear();
 });
 
@@ -194,6 +196,31 @@ describe("thread outbox drain delivery cleanup", () => {
     await expect(completeQueuedMessageDelivery(message, deliveryRevision)).resolves.toBe("removed");
 
     expect(remainingMessages()).toEqual([]);
+  });
+
+  it("keeps a delivered message when its editor opens during storage removal", async () => {
+    const message = queuedMessage({
+      messageId: "message-editor-removal-race",
+      text: "keep editor changes",
+      fileUri: "file:///documents/t3-composer-attachments/editor-race.pdf",
+    });
+    const removeStarted = Promise.withResolvers<void>();
+    const removeBarrier = Promise.withResolvers<void>();
+    harness.removeOutboxMessage.mockImplementationOnce(async () => {
+      removeStarted.resolve();
+      await removeBarrier.promise;
+    });
+    await harness.manager.enqueue(message);
+    const deliveryRevision = harness.manager.revisionOf(message.messageId);
+
+    const cleanup = completeQueuedMessageDelivery(message, deliveryRevision);
+    await removeStarted.promise;
+    appAtomRegistry.set(editingQueuedMessageIdsAtom, { [message.messageId]: true });
+    removeBarrier.resolve();
+
+    await expect(cleanup).resolves.toBe("edited");
+    expect(remainingMessages()).toEqual([message]);
+    expect(harness.removePersistedFile).not.toHaveBeenCalled();
   });
 });
 
