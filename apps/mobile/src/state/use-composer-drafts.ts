@@ -925,7 +925,10 @@ export function clearComposerDraftContent(
   }
 }
 
-export function clearComposerDraft(draftKey: string): void {
+export function clearComposerDraft(
+  draftKey: string,
+  options?: { readonly deferAttachmentCleanup?: boolean },
+): void {
   const previousAttachments = getComposerDraftSnapshot(draftKey).attachments;
   updateComposerDrafts((current) => {
     if (!current[draftKey]) {
@@ -935,7 +938,9 @@ export function clearComposerDraft(draftKey: string): void {
     delete next[draftKey];
     return next;
   });
-  scheduleUnusedComposerAttachmentCleanup(previousAttachments);
+  if (!options?.deferAttachmentCleanup) {
+    scheduleUnusedComposerAttachmentCleanup(previousAttachments);
+  }
 }
 
 export function removeComposerDraftsForEnvironment(
