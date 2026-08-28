@@ -323,11 +323,31 @@ export async function releaseUnusedComposerAttachmentFiles(
   }
   await flushThreadOutbox();
 
+  if ([...candidates].every(isComposerAttachmentFileReferenced)) {
+    return;
+  }
+
+  let incomingShareFileUris: ReadonlySet<string>;
+  try {
+    const { loadIncomingShareDrafts } = await import("../features/sharing/incoming-share-storage");
+    const incomingShares = await loadIncomingShareDrafts({ strict: true });
+    incomingShareFileUris = new Set(
+      incomingShares.flatMap((share) =>
+        share.attachments.flatMap((attachment) =>
+          attachment.type === "file" ? [attachment.fileUri] : [],
+        ),
+      ),
+    );
+  } catch (error) {
+    console.warn("[composer-attachments] could not verify incoming share ownership", error);
+    return;
+  }
+
   const { removePersistedComposerAttachmentFile } = await import("../lib/composerImages");
   for (const fileUri of candidates) {
     // Re-check ownership immediately before each deletion: a restore or edit
     // can re-own a file after an earlier scan decided it was unused.
-    if (isComposerAttachmentFileReferenced(fileUri)) {
+    if (isComposerAttachmentFileReferenced(fileUri) || incomingShareFileUris.has(fileUri)) {
       continue;
     }
     await removePersistedComposerAttachmentFile(fileUri);
@@ -833,12 +853,15 @@ export function undoComposerDraftMergeState(
   >(
     key: K,
   ): ComposerDraft[K] => (existing[key] === merged[key] ? snapshot[key] : existing[key]);
+  const text =
+    insertedText.length > 0 && existing.text.startsWith(merged.text)
+      ? snapshot.text + existing.text.slice(merged.text.length)
+      : insertedText.length > 0 && existing.text.endsWith(insertedText)
+        ? existing.text.slice(0, existing.text.length - insertedText.length)
+        : existing.text;
   const draft = {
     ...existing,
-    text:
-      insertedText.length > 0 && existing.text.endsWith(insertedText)
-        ? existing.text.slice(0, existing.text.length - insertedText.length)
-        : existing.text,
+    text,
     attachments: existing.attachments.filter(
       (attachment) => !insertedAttachmentIds.has(attachment.id),
     ),

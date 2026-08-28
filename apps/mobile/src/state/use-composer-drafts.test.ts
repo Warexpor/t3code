@@ -89,6 +89,12 @@ const composerAttachmentCleanupMocks = vi.hoisted(() => ({
   remove: vi.fn(async () => undefined),
 }));
 
+const incomingShareStorageMocks = vi.hoisted(() => ({
+  load: vi.fn<typeof import("../features/sharing/incoming-share-storage").loadIncomingShareDrafts>(
+    async () => [],
+  ),
+}));
+
 vi.mock("expo-file-system", () => ({
   Directory: composerDraftFileMocks.Directory,
   File: composerDraftFileMocks.File,
@@ -97,6 +103,10 @@ vi.mock("expo-file-system", () => ({
 
 vi.mock("../lib/composerImages", () => ({
   removePersistedComposerAttachmentFile: composerAttachmentCleanupMocks.remove,
+}));
+
+vi.mock("../features/sharing/incoming-share-storage", () => ({
+  loadIncomingShareDrafts: incomingShareStorageMocks.load,
 }));
 
 import { appAtomRegistry } from "./atom-registry";
@@ -143,6 +153,8 @@ afterEach(() => {
   appAtomRegistry.set(stickyComposerModelSelectionAtom, null);
   appAtomRegistry.set(threadOutboxManager.queuedMessagesByThreadKeyAtom, {});
   composerAttachmentCleanupMocks.remove.mockClear();
+  incomingShareStorageMocks.load.mockReset();
+  incomingShareStorageMocks.load.mockResolvedValue([]);
 });
 
 describe("mobile composer drafts", () => {
@@ -329,6 +341,62 @@ describe("mobile composer drafts", () => {
     } finally {
       load.mockRestore();
     }
+  });
+
+  it("keeps a file until its incoming share is consumed", async () => {
+    const outboxLoad = vi.spyOn(threadOutboxManager, "load").mockResolvedValue(true);
+    onTestFinished(() => outboxLoad.mockRestore());
+    const file = {
+      id: "file-incoming",
+      type: "file" as const,
+      name: "report.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 42,
+      fileUri: "file:///documents/t3-composer-attachments/incoming.pdf",
+    };
+    incomingShareStorageMocks.load
+      .mockResolvedValueOnce([
+        {
+          schemaVersion: 1,
+          id: "share-1",
+          createdAt: "2026-08-28T12:00:00.000Z",
+          text: "Review this file",
+          attachments: [file],
+          warnings: [],
+        },
+      ])
+      .mockResolvedValueOnce([]);
+
+    await releaseUnusedComposerAttachmentFiles([file]);
+
+    expect(incomingShareStorageMocks.load).toHaveBeenLastCalledWith({ strict: true });
+    expect(composerAttachmentCleanupMocks.remove).not.toHaveBeenCalled();
+
+    await releaseUnusedComposerAttachmentFiles([file]);
+
+    expect(incomingShareStorageMocks.load).toHaveBeenCalledTimes(2);
+    expect(composerAttachmentCleanupMocks.remove).toHaveBeenCalledWith(file.fileUri);
+  });
+
+  it("does not delete files when incoming share ownership cannot be loaded", async () => {
+    const outboxLoad = vi.spyOn(threadOutboxManager, "load").mockResolvedValue(true);
+    onTestFinished(() => outboxLoad.mockRestore());
+    const file = {
+      id: "file-incoming-unknown",
+      type: "file" as const,
+      name: "report.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 42,
+      fileUri: "file:///documents/t3-composer-attachments/incoming-unknown.pdf",
+    };
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    incomingShareStorageMocks.load.mockRejectedValueOnce(new Error("inbox unavailable"));
+    onTestFinished(() => warning.mockRestore());
+
+    await releaseUnusedComposerAttachmentFiles([file]);
+
+    expect(incomingShareStorageMocks.load).toHaveBeenCalledWith({ strict: true });
+    expect(composerAttachmentCleanupMocks.remove).not.toHaveBeenCalled();
   });
 
   it("does not delete attachment files when the draft removal cannot be saved", async () => {
@@ -960,6 +1028,30 @@ describe("mobile composer drafts", () => {
     ).toEqual({
       [draftKey]: { text: "totally rewritten", attachments: [] },
     });
+  });
+
+  it("keeps text appended after a merge when rolling it back", () => {
+    const draftKey = "environment-1:thread-1";
+    const snapshot: ComposerDraft = { text: "typed before", attachments: [] };
+    const content = { text: "queued text", attachments: [] };
+    const merged = mergeComposerDraftContentState({ [draftKey]: snapshot }, draftKey, content)[
+      draftKey
+    ]!;
+    const edited: ComposerDraft = {
+      ...merged,
+      text: `${merged.text}\n\nuser follow-up`,
+    };
+
+    const rolledBack = undoComposerDraftMergeState(
+      { [draftKey]: edited },
+      draftKey,
+      snapshot,
+      merged,
+    );
+
+    expect(rolledBack[draftKey]?.text).toBe("typed before\n\nuser follow-up");
+    const retried = mergeComposerDraftContentState(rolledBack, draftKey, content);
+    expect(retried[draftKey]?.text.match(/queued text/g)).toHaveLength(1);
   });
 
   it("spares a file re-owned between the sweep's scan and its deletion", async () => {
