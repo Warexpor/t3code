@@ -326,14 +326,14 @@ export function useThreadComposerState() {
       existingCount: composerDrafts[threadKey]?.attachments.length ?? 0,
     });
     const rejectedImageCount = appendComposerDraftAttachments(threadKey, result.images);
-    if (!result.error && rejectedImageCount > 0) {
-      Alert.alert(
-        "Could not attach image",
-        `You can attach up to ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS} files per message.`,
-      );
-    }
-    if (result.error) {
-      setPendingConnectionError(result.error);
+    const problems = [
+      ...(result.error ? [result.error] : []),
+      ...(rejectedImageCount > 0
+        ? [`You can attach up to ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS} attachments per message.`]
+        : []),
+    ];
+    if (problems.length > 0) {
+      Alert.alert("Could not attach image", problems.join("\n\n"));
     }
   }, [composerDrafts, selectedThreadShell]);
 
