@@ -1,5 +1,5 @@
 import { CommandId, EnvironmentId, MessageId, ThreadId } from "@t3tools/contracts";
-import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const harness = vi.hoisted(() => ({
   manager: null as unknown as ReturnType<
@@ -116,9 +116,11 @@ vi.mock("./thread-outbox", async () => {
 
 import { appAtomRegistry } from "./atom-registry";
 import type { QueuedThreadMessage } from "./thread-outbox-model";
-import { composerDraftsAtom, getComposerDraftSnapshot } from "./use-composer-drafts";
+import * as composerDrafts from "./use-composer-drafts";
+import { editingQueuedMessageIdsAtom } from "./use-thread-outbox";
 import {
   completeQueuedMessageDelivery,
+  recoverEditedCreationAfterDelivery,
   restoreRejectedQueuedMessage,
 } from "./use-thread-outbox-drain";
 
@@ -153,9 +155,14 @@ function remainingMessages(): ReadonlyArray<QueuedThreadMessage> {
   return Object.values(appAtomRegistry.get(harness.manager.queuedMessagesByThreadKeyAtom)).flat();
 }
 
+beforeEach(() => {
+  harness.draftFile.setDocument({ schemaVersion: 1, drafts: {} });
+});
+
 afterEach(() => {
   appAtomRegistry.set(harness.manager.queuedMessagesByThreadKeyAtom, {});
-  appAtomRegistry.set(composerDraftsAtom, {});
+  appAtomRegistry.set(composerDrafts.composerDraftsAtom, {});
+  appAtomRegistry.set(editingQueuedMessageIdsAtom, {});
   harness.draftFile.setWriteError(null);
   harness.removePersistedFile.mockClear();
   harness.setPendingConnectionError.mockClear();
@@ -190,11 +197,133 @@ describe("thread outbox drain delivery cleanup", () => {
   });
 });
 
+describe("thread outbox delivered creation recovery", () => {
+  it("keeps an edit accepted while the older payload is persisted to the draft", async () => {
+    const message = queuedMessage({
+      messageId: "message-recovery-race",
+      text: "original queued text",
+      fileUri: "file:///documents/t3-composer-attachments/report.pdf",
+    });
+    const originalMergeComposerDraftContent = composerDrafts.mergeComposerDraftContent;
+    const mergeCompleted = Promise.withResolvers<void>();
+    const releaseRecovery = Promise.withResolvers<void>();
+    const mergeSpy = vi
+      .spyOn(composerDrafts, "mergeComposerDraftContent")
+      .mockImplementation(async (draftKey, content) => {
+        const result = await originalMergeComposerDraftContent(draftKey, content);
+        mergeCompleted.resolve();
+        await releaseRecovery.promise;
+        return result;
+      });
+
+    try {
+      await harness.manager.enqueue(message);
+      const recovery = recoverEditedCreationAfterDelivery(message);
+      await mergeCompleted.promise;
+
+      const newer = { ...message, text: "edited while recovery persisted the draft" };
+      await harness.manager.update(newer);
+
+      releaseRecovery.resolve();
+      await expect(recovery).resolves.toBe(false);
+
+      expect(remainingMessages()).toEqual([newer]);
+      expect(
+        composerDrafts.getComposerDraftSnapshot(`${message.environmentId}:${message.threadId}`),
+      ).toMatchObject({ text: message.text, attachments: [] });
+      expect(harness.removePersistedFile).not.toHaveBeenCalled();
+    } finally {
+      releaseRecovery.resolve();
+      mergeSpy.mockRestore();
+    }
+  });
+
+  it("leaves recovery to an editor that opens while the draft persists", async () => {
+    const message = queuedMessage({
+      messageId: "message-recovery-editor",
+      text: "recover this text",
+      fileUri: "file:///documents/t3-composer-attachments/editor.pdf",
+    });
+    const originalMergeComposerDraftContent = composerDrafts.mergeComposerDraftContent;
+    const mergeCompleted = Promise.withResolvers<void>();
+    const releaseRecovery = Promise.withResolvers<void>();
+    const mergeSpy = vi
+      .spyOn(composerDrafts, "mergeComposerDraftContent")
+      .mockImplementation(async (draftKey, content) => {
+        const result = await originalMergeComposerDraftContent(draftKey, content);
+        mergeCompleted.resolve();
+        await releaseRecovery.promise;
+        return result;
+      });
+
+    try {
+      await harness.manager.enqueue(message);
+      const recovery = recoverEditedCreationAfterDelivery(message);
+      await mergeCompleted.promise;
+      appAtomRegistry.set(editingQueuedMessageIdsAtom, { [message.messageId]: true });
+
+      releaseRecovery.resolve();
+      await expect(recovery).resolves.toBe(true);
+
+      expect(remainingMessages()).toEqual([message]);
+      expect(
+        composerDrafts.getComposerDraftSnapshot(`${message.environmentId}:${message.threadId}`),
+      ).toMatchObject({ text: message.text, attachments: [] });
+      expect(harness.removePersistedFile).not.toHaveBeenCalled();
+    } finally {
+      releaseRecovery.resolve();
+      mergeSpy.mockRestore();
+    }
+  });
+
+  it("retries a failed removal without duplicating recovered draft content", async () => {
+    const message = queuedMessage({
+      messageId: "message-recovery-removal",
+      text: "recover once",
+      fileUri: "file:///documents/t3-composer-attachments/retry.pdf",
+    });
+    const draftKey = `${message.environmentId}:${message.threadId}`;
+    const removeSpy = vi
+      .spyOn(harness.manager, "remove")
+      .mockRejectedValueOnce(new Error("storage unavailable"));
+
+    try {
+      await harness.manager.enqueue(message);
+
+      await expect(recoverEditedCreationAfterDelivery(message)).resolves.toBe(false);
+      expect(remainingMessages()).toEqual([message]);
+
+      await expect(recoverEditedCreationAfterDelivery(message)).resolves.toBe(true);
+
+      const draft = composerDrafts.getComposerDraftSnapshot(draftKey);
+      expect(draft.text).toBe(message.text);
+      expect(draft.attachments).toEqual(message.attachments);
+      expect(remainingMessages()).toEqual([]);
+      expect(harness.removePersistedFile).not.toHaveBeenCalled();
+    } finally {
+      removeSpy.mockRestore();
+    }
+  });
+
+  it("keeps the queue entry when the recovered draft cannot persist", async () => {
+    const message = queuedMessage({
+      messageId: "message-recovery-persistence",
+      text: "recover after persistence returns",
+    });
+    await harness.manager.enqueue(message);
+    harness.draftFile.setWriteError(new Error("disk full"));
+
+    await expect(recoverEditedCreationAfterDelivery(message)).resolves.toBe(false);
+
+    expect(remainingMessages()).toEqual([message]);
+  });
+});
+
 describe("thread outbox recovery rollback", () => {
   it("rolls a failed recovery merge back so the retry cannot duplicate the text", async () => {
     const message = queuedMessage({ messageId: "message-restore", text: "queued text" });
     const draftKey = `${message.environmentId}:${message.threadId}`;
-    appAtomRegistry.set(composerDraftsAtom, {
+    appAtomRegistry.set(composerDrafts.composerDraftsAtom, {
       [draftKey]: { text: "typed offline", attachments: [] },
     });
     await harness.manager.enqueue(message);
@@ -203,14 +332,16 @@ describe("thread outbox recovery rollback", () => {
     await expect(restoreRejectedQueuedMessage(message, "too large")).resolves.toBe("retry");
 
     // The merge was rolled back and the message stayed queued for the retry.
-    expect(getComposerDraftSnapshot(draftKey).text).toBe("typed offline");
+    expect(composerDrafts.getComposerDraftSnapshot(draftKey).text).toBe("typed offline");
     expect(remainingMessages()).toEqual([message]);
 
     harness.draftFile.setWriteError(null);
     await expect(restoreRejectedQueuedMessage(message, "too large")).resolves.toBe("restored");
 
     // The recovered text landed exactly once and the message left the queue.
-    expect(getComposerDraftSnapshot(draftKey).text).toBe("typed offline\n\nqueued text");
+    expect(composerDrafts.getComposerDraftSnapshot(draftKey).text).toBe(
+      "typed offline\n\nqueued text",
+    );
     expect(remainingMessages()).toEqual([]);
     expect(harness.setPendingConnectionError).toHaveBeenCalledWith("too large");
   });

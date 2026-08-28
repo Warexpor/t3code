@@ -196,16 +196,22 @@ export async function completeQueuedMessageDelivery(
  * edited payload is still queued. The next drain would see the created thread
  * and take the creation "remove" path, silently discarding the edit; hand the
  * edited content to the new thread's composer instead and remove the entry.
+ * Returns true when recovery is complete or an open editor owns the next
+ * action, and false when the drain should retry with backoff.
  * Exported for tests; the drain is the only production caller.
  */
 export async function recoverEditedCreationAfterDelivery(
   queuedMessage: QueuedThreadMessage,
-): Promise<void> {
+): Promise<boolean> {
   const kept = Object.values(appAtomRegistry.get(threadOutboxManager.queuedMessagesByThreadKeyAtom))
     .flat()
     .find((candidate) => candidate.messageId === queuedMessage.messageId);
   if (!kept) {
-    return;
+    return true;
+  }
+  const keptRevision = threadOutboxRevision(kept.messageId);
+  if (appAtomRegistry.get(editingQueuedMessageIdsAtom)[kept.messageId]) {
+    return true;
   }
   const draftKey = scopedThreadKey(kept.environmentId, kept.threadId);
   try {
@@ -214,7 +220,20 @@ export async function recoverEditedCreationAfterDelivery(
     // send-failure restore; the send path refuses over-cap drafts, so the
     // state stays recoverable.
     await mergeComposerDraftContent(draftKey, { text: kept.text, attachments: [] });
-    appendComposerDraftAttachments(draftKey, kept.attachments, { allowOverflow: true });
+    if (appAtomRegistry.get(editingQueuedMessageIdsAtom)[kept.messageId]) {
+      return true;
+    }
+    if (threadOutboxRevision(kept.messageId) !== keptRevision) {
+      return false;
+    }
+    const existingAttachmentIds = new Set(
+      getComposerDraftSnapshot(draftKey).attachments.map((attachment) => attachment.id),
+    );
+    appendComposerDraftAttachments(
+      draftKey,
+      kept.attachments.filter((attachment) => !existingAttachmentIds.has(attachment.id)),
+      { allowOverflow: true },
+    );
     // Only settings the queued message actually carries: spreading explicit
     // undefined would clear choices the user already made on the draft.
     updateComposerDraftSettings(draftKey, {
@@ -226,16 +245,20 @@ export async function recoverEditedCreationAfterDelivery(
     // only durable copy until the draft lands, so flush before removing.
     await flushComposerDrafts();
   } catch (error) {
-    // The entry stays queued; the next drain's duplicate-creation removal
-    // still releases its files, matching the behavior before this recovery
-    // existed. Better a lost edit on a failing device than a lost edit plus
-    // a wedged queue.
+    // Keep the entry queued. The drain retries with backoff, and the merge is
+    // idempotent so content that persisted before the failure is not repeated.
     console.warn("[thread-outbox] could not hand an edited pending task to the composer", error);
-    return;
+    return false;
   }
-  await removeThreadOutboxMessage(kept).catch((error) => {
+  if (appAtomRegistry.get(editingQueuedMessageIdsAtom)[kept.messageId]) {
+    return true;
+  }
+  try {
+    return await removeThreadOutboxMessage(kept, keptRevision);
+  } catch (error) {
     console.warn("[thread-outbox] could not remove recovered pending task", error);
-  });
+    return false;
+  }
 }
 
 /** Exported for tests; the drain is the only production caller. */
@@ -730,8 +753,7 @@ export function useThreadOutboxDrain(): void {
         }
         // The thread exists now, so the next drain would remove the edited
         // payload as a duplicate creation. Hand it to the thread's composer.
-        await recoverEditedCreationAfterDelivery(queuedMessage);
-        return true;
+        return recoverEditedCreationAfterDelivery(queuedMessage);
       }
       if (outcome === "removed") {
         await prepared.releaseUploads().catch((error) => {
@@ -910,7 +932,7 @@ export function useThreadOutboxDrain(): void {
               // recovered duplicate the user can delete). Restart loses any
               // in-memory distinction, and losing edits is the worse failure,
               // so recovery is unconditional here.
-              recoverEditedCreationAfterDelivery(nextQueuedMessage).then(() => true)
+              recoverEditedCreationAfterDelivery(nextQueuedMessage)
             : removeQueuedMessage("[thread-outbox] failed to remove message for a missing thread")
           : creation !== undefined
             ? creationProjectCwd !== null
