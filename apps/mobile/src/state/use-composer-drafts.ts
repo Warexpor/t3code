@@ -788,7 +788,7 @@ export async function restoreComposerDraftSnapshot(
   );
 }
 
-function sameComposerDraftState(a: ComposerDraft, b: ComposerDraft): boolean {
+export function sameComposerDraftState(a: ComposerDraft, b: ComposerDraft): boolean {
   return (
     a.text === b.text &&
     a.attachments === b.attachments &&
