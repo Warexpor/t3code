@@ -1,12 +1,15 @@
 import { CommandId, EnvironmentId, MessageId, ThreadId } from "@t3tools/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
+import type { PreparedTurnAttachments } from "../lib/attachmentUpload";
+
 const harness = vi.hoisted(() => ({
   manager: null as unknown as ReturnType<
     typeof import("./thread-outbox-manager").createThreadOutboxManager
   >,
   removePersistedFile: vi.fn(async () => undefined),
   removeOutboxMessage: vi.fn(async (_message: QueuedThreadMessage) => undefined),
+  prepareTurnAttachments: vi.fn<typeof import("../lib/attachmentUpload").prepareTurnAttachments>(),
   setPendingConnectionError: vi.fn(),
   draftFile: (() => {
     let document = "";
@@ -61,7 +64,7 @@ vi.mock("../lib/uuid", () => ({
 }));
 
 vi.mock("../lib/attachmentUpload", () => ({
-  prepareTurnAttachments: vi.fn(),
+  prepareTurnAttachments: harness.prepareTurnAttachments,
 }));
 
 vi.mock("./entities", () => ({
@@ -121,6 +124,7 @@ import * as composerDrafts from "./use-composer-drafts";
 import { editingQueuedMessageIdsAtom } from "./use-thread-outbox";
 import {
   completeQueuedMessageDelivery,
+  prepareQueuedMessageAttachments,
   recoverEditedCreationAfterDelivery,
   restoreRejectedQueuedMessage,
 } from "./use-thread-outbox-drain";
@@ -152,6 +156,24 @@ function queuedMessage(input: {
   };
 }
 
+function withReusedFileUpload(
+  message: QueuedThreadMessage,
+  attachmentId: string,
+): QueuedThreadMessage {
+  return {
+    ...message,
+    attachments: message.attachments.map((attachment) =>
+      attachment.type === "file"
+        ? {
+            ...attachment,
+            uploadedAttachmentId: attachmentId,
+            uploadEnvironmentId: message.environmentId,
+          }
+        : attachment,
+    ),
+  };
+}
+
 function remainingMessages(): ReadonlyArray<QueuedThreadMessage> {
   return Object.values(appAtomRegistry.get(harness.manager.queuedMessagesByThreadKeyAtom)).flat();
 }
@@ -167,7 +189,127 @@ afterEach(() => {
   harness.draftFile.setWriteError(null);
   harness.removePersistedFile.mockClear();
   harness.removeOutboxMessage.mockClear();
+  harness.prepareTurnAttachments.mockReset();
   harness.setPendingConnectionError.mockClear();
+});
+
+describe("thread outbox attachment preparation", () => {
+  it("abandons reused uploads when an editor saves changed text during verification", async () => {
+    const message = withReusedFileUpload(
+      queuedMessage({
+        messageId: "message-reused-upload-race",
+        text: "original text",
+        fileUri: "file:///documents/t3-composer-attachments/reused.pdf",
+      }),
+      "pending-reused-upload",
+    );
+    const preparationStarted = Promise.withResolvers<void>();
+    const preparationBarrier = Promise.withResolvers<PreparedTurnAttachments>();
+    const releaseUploads = vi.fn(async () => undefined);
+    harness.prepareTurnAttachments.mockImplementationOnce(async () => {
+      preparationStarted.resolve();
+      return preparationBarrier.promise;
+    });
+    await harness.manager.enqueue(message);
+    appAtomRegistry.set(editingQueuedMessageIdsAtom, { [message.messageId]: true });
+
+    const preparation = prepareQueuedMessageAttachments(message);
+    await preparationStarted.promise;
+    const edited = { ...message, text: "saved editor text" };
+    await harness.manager.update(edited);
+    appAtomRegistry.set(editingQueuedMessageIdsAtom, {});
+    preparationBarrier.resolve({
+      status: "ready",
+      attachments: [],
+      draftAttachments: message.attachments,
+      pendingAttachmentIds: ["pending-reused-upload"],
+      releaseUploads,
+    });
+
+    await expect(preparation).resolves.toEqual({ status: "abandoned" });
+    expect(remainingMessages()).toEqual([edited]);
+    expect(releaseUploads).not.toHaveBeenCalled();
+  });
+
+  it("keeps an unchanged queued payload ready after attachment reuse", async () => {
+    const message = withReusedFileUpload(
+      queuedMessage({
+        messageId: "message-reused-upload-current",
+        text: "unchanged text",
+        fileUri: "file:///documents/t3-composer-attachments/current.pdf",
+      }),
+      "pending-reused-upload",
+    );
+    const releaseUploads = vi.fn(async () => undefined);
+    harness.prepareTurnAttachments.mockResolvedValueOnce({
+      status: "ready",
+      attachments: [],
+      draftAttachments: message.attachments,
+      pendingAttachmentIds: ["pending-reused-upload"],
+      releaseUploads,
+    });
+    await harness.manager.enqueue(message);
+    const revision = harness.manager.revisionOf(message.messageId);
+    appAtomRegistry.set(editingQueuedMessageIdsAtom, { [message.messageId]: true });
+
+    await expect(prepareQueuedMessageAttachments(message)).resolves.toMatchObject({
+      status: "ready",
+      persistedMessage: message,
+      deliveryRevision: revision,
+    });
+    expect(releaseUploads).not.toHaveBeenCalled();
+  });
+
+  it("uses the known next revision after persisting uploaded references", async () => {
+    const message = queuedMessage({
+      messageId: "message-new-upload-revision",
+      text: "upload this file",
+      fileUri: "file:///documents/t3-composer-attachments/new.pdf",
+    });
+    const uploadedAttachments = message.attachments.map((attachment) =>
+      attachment.type === "file"
+        ? {
+            ...attachment,
+            uploadedAttachmentId: "pending-new-upload",
+            uploadEnvironmentId: message.environmentId,
+          }
+        : attachment,
+    );
+    harness.prepareTurnAttachments.mockImplementationOnce(async (input) => {
+      expect(await input.persistUploadedReferences?.(uploadedAttachments)).toBe("persisted");
+      return {
+        status: "ready",
+        attachments: [],
+        draftAttachments: uploadedAttachments,
+        pendingAttachmentIds: ["pending-new-upload"],
+        releaseUploads: async () => undefined,
+      };
+    });
+    await harness.manager.enqueue(message);
+    const revision = harness.manager.revisionOf(message.messageId);
+
+    const result = await prepareQueuedMessageAttachments(message);
+
+    expect(result).toMatchObject({
+      status: "ready",
+      persistedMessage: { attachments: uploadedAttachments },
+      deliveryRevision: revision + 1,
+    });
+    expect(harness.manager.revisionOf(message.messageId)).toBe(revision + 1);
+  });
+
+  it("does not prepare a payload that was already replaced", async () => {
+    const message = queuedMessage({ messageId: "message-stale-before-upload", text: "old" });
+    await harness.manager.enqueue(message);
+    const edited = { ...message, text: "new" };
+    await harness.manager.update(edited);
+
+    await expect(prepareQueuedMessageAttachments(message)).resolves.toEqual({
+      status: "abandoned",
+    });
+    expect(harness.prepareTurnAttachments).not.toHaveBeenCalled();
+    expect(remainingMessages()).toEqual([edited]);
+  });
 });
 
 describe("thread outbox drain delivery cleanup", () => {

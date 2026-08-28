@@ -109,12 +109,12 @@ function settingsCommandId(message: QueuedThreadMessage, setting: string): Comma
 /**
  * Uploads a queued message's attachments and persists the uploaded ids back
  * onto the queued message. The revision-checked update means an edit accepted
- * while the bytes uploaded wins: this attempt then abandons (the owner call
- * deletes the uploads it minted) and the next drain pass re-reads the message.
+ * while the bytes uploaded wins: this attempt abandons and the next drain pass
+ * re-reads the message.
  * `deliveryRevision` is the revision of the payload this attempt will send,
- * read for the delivery removal's compare-and-set.
+ * used for the delivery removal's compare-and-set.
  */
-async function prepareQueuedMessageAttachments(queuedMessage: QueuedThreadMessage): Promise<
+export async function prepareQueuedMessageAttachments(queuedMessage: QueuedThreadMessage): Promise<
   | {
       readonly status: "ready";
       readonly prepared: PreparedTurnAttachments;
@@ -123,7 +123,13 @@ async function prepareQueuedMessageAttachments(queuedMessage: QueuedThreadMessag
     }
   | { readonly status: "abandoned" }
 > {
+  if (!(await confirmThreadOutboxMessageQueued(queuedMessage))) {
+    return { status: "abandoned" };
+  }
   const revision = threadOutboxRevision(queuedMessage.messageId);
+  if (!isQueuedMessagePayloadCurrent(queuedMessage, revision)) {
+    return { status: "abandoned" };
+  }
   let persistedMessage = queuedMessage;
   let deliveryRevision = revision;
   const result = await prepareTurnAttachments({
@@ -138,13 +144,29 @@ async function prepareQueuedMessageAttachments(queuedMessage: QueuedThreadMessag
         return "abandon";
       }
       persistedMessage = updatedMessage;
-      deliveryRevision = threadOutboxRevision(queuedMessage.messageId);
+      deliveryRevision = revision + 1;
       return "persisted";
     },
   });
-  return result.status === "abandoned"
-    ? { status: "abandoned" }
-    : { status: "ready", prepared: result, persistedMessage, deliveryRevision };
+  if (
+    result.status === "abandoned" ||
+    !isQueuedMessagePayloadCurrent(persistedMessage, deliveryRevision)
+  ) {
+    return { status: "abandoned" };
+  }
+  return { status: "ready", prepared: result, persistedMessage, deliveryRevision };
+}
+
+function isQueuedMessagePayloadCurrent(
+  message: QueuedThreadMessage,
+  expectedRevision: number,
+): boolean {
+  return (
+    threadOutboxRevision(message.messageId) === expectedRevision &&
+    Object.values(appAtomRegistry.get(threadOutboxManager.queuedMessagesByThreadKeyAtom))
+      .flat()
+      .some((candidate) => candidate === message)
+  );
 }
 
 /**
@@ -632,6 +654,7 @@ export function useThreadOutboxDrain(): void {
       }
 
       let prepared: PreparedTurnAttachments;
+      let persistedMessage: QueuedThreadMessage;
       let deliveryRevision: number;
       try {
         const preparedResult = await prepareQueuedMessageAttachments(queuedMessage);
@@ -639,6 +662,7 @@ export function useThreadOutboxDrain(): void {
           return true;
         }
         prepared = preparedResult.prepared;
+        persistedMessage = preparedResult.persistedMessage;
         deliveryRevision = preparedResult.deliveryRevision;
         if (appAtomRegistry.get(editingQueuedMessageIdsAtom)[queuedMessage.messageId]) {
           await preserveUploadedAttachmentsForEditor(
@@ -656,6 +680,9 @@ export function useThreadOutboxDrain(): void {
           );
         }
         return false;
+      }
+      if (!isQueuedMessagePayloadCurrent(persistedMessage, deliveryRevision)) {
+        return true;
       }
       const deliveryResult = await startTurn({
         environmentId: queuedMessage.environmentId,
@@ -706,6 +733,7 @@ export function useThreadOutboxDrain(): void {
         return false;
       }
       let prepared: PreparedTurnAttachments;
+      let persistedMessage: QueuedThreadMessage;
       let deliveryRevision: number;
       try {
         const preparedResult = await prepareQueuedMessageAttachments(queuedMessage);
@@ -713,6 +741,7 @@ export function useThreadOutboxDrain(): void {
           return true;
         }
         prepared = preparedResult.prepared;
+        persistedMessage = preparedResult.persistedMessage;
         deliveryRevision = preparedResult.deliveryRevision;
         if (appAtomRegistry.get(editingQueuedMessageIdsAtom)[queuedMessage.messageId]) {
           await preserveUploadedAttachmentsForEditor(
@@ -730,6 +759,9 @@ export function useThreadOutboxDrain(): void {
           );
         }
         return false;
+      }
+      if (!isQueuedMessagePayloadCurrent(persistedMessage, deliveryRevision)) {
+        return true;
       }
       const deliveryResult = await startTurn({
         environmentId: queuedMessage.environmentId,
