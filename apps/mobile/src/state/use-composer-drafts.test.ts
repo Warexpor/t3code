@@ -133,6 +133,7 @@ import {
   setComposerDraftText,
   setStickyComposerModelSelection,
   stickyComposerModelSelectionAtom,
+  undoComposerDraftMerge,
   undoComposerDraftMergeState,
 } from "./use-composer-drafts";
 
@@ -941,6 +942,34 @@ describe("mobile composer drafts", () => {
         merged,
       ),
     ).toEqual({});
+  });
+
+  it("persists an async merge rollback with the sticky model selection", async () => {
+    const draftKey = "environment-1:thread-1";
+    const snapshot: ComposerDraft = { text: "typed before", attachments: [] };
+    const merged: ComposerDraft = {
+      text: "typed before\n\nqueued text",
+      attachments: [],
+    };
+    composerDraftFileMocks.setDocument({
+      schemaVersion: 1,
+      drafts: { [draftKey]: merged },
+      stickyModelSelection: {
+        instanceId: "codex",
+        model: "gpt-5.6-sol",
+      },
+    });
+
+    await undoComposerDraftMerge(draftKey, snapshot, merged);
+
+    expect(JSON.parse(composerDraftFileMocks.getDocument())).toEqual({
+      schemaVersion: 1,
+      drafts: { [draftKey]: snapshot },
+      stickyModelSelection: {
+        instanceId: "codex",
+        model: "gpt-5.6-sol",
+      },
+    });
   });
 
   it("returns merge-written settings to the snapshot but keeps user-edited ones", () => {

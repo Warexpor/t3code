@@ -902,7 +902,9 @@ export async function undoComposerDraftMerge(
     merged,
   );
   appAtomRegistry.set(composerDraftsAtom, next);
-  await persistenceQueue.run(() => writePersistedComposerDrafts(next));
+  await persistenceQueue.run(() =>
+    writePersistedComposerState(next, appAtomRegistry.get(stickyComposerModelSelectionAtom)),
+  );
 }
 
 export function clearComposerDraftContent(

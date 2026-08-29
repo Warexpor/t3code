@@ -280,13 +280,10 @@ function MessageAttachmentFile(props: {
       }}
     >
       <SymbolView name="doc.text" size={16} tintColor="#a3a3a3" type="monochrome" />
-      <Text
-        className="min-w-0 flex-1 text-sm text-neutral-900 dark:text-neutral-100"
-        numberOfLines={1}
-      >
+      <Text className="min-w-0 flex-1 text-sm text-foreground" numberOfLines={1}>
         {attachment.name}
       </Text>
-      <Text className="text-xs text-neutral-500 dark:text-neutral-400">
+      <Text className="text-xs text-foreground-muted">
         {formatAttachmentSize(attachment.sizeBytes)}
       </Text>
     </Pressable>
@@ -301,10 +298,7 @@ function MessageAttachmentUnknown(props: { readonly name: string }) {
   return (
     <View className="flex-row items-center gap-2 py-1">
       <SymbolView name="doc.text" size={16} tintColor="#a3a3a3" type="monochrome" />
-      <Text
-        className="min-w-0 flex-1 text-sm text-neutral-900 dark:text-neutral-100"
-        numberOfLines={1}
-      >
+      <Text className="min-w-0 flex-1 text-sm text-foreground" numberOfLines={1}>
         {props.name}
       </Text>
     </View>
