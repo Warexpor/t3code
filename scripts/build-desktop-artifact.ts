@@ -3308,6 +3308,8 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   );
   const builderArgs = [
     "exec",
+    "vp",
+    "exec",
     "--filter",
     "@t3tools/desktop",
     "--",
@@ -3319,7 +3321,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     "--publish",
     "never",
   ];
-  const builderCommand = yield* resolveSpawnCommand("vp", builderArgs, { env: buildEnv });
+  const builderCommand = yield* resolveSpawnCommand("pnpm", builderArgs, { env: buildEnv });
   yield* runCommand(
     ChildProcess.make(builderCommand.command, builderCommand.args, {
       cwd: repoRoot,
