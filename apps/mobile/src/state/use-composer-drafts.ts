@@ -297,6 +297,24 @@ function isComposerAttachmentFileReferenced(fileUri: string): boolean {
   );
 }
 
+function isComposerAttachmentUploadReferenced(
+  environmentId: EnvironmentId,
+  attachmentId: string,
+): boolean {
+  const drafts = Object.values(appAtomRegistry.get(composerDraftsAtom));
+  const queuedMessages = Object.values(
+    appAtomRegistry.get(threadOutboxManager.queuedMessagesByThreadKeyAtom),
+  ).flat();
+  return [...drafts, ...queuedMessages].some((owner) =>
+    owner.attachments.some(
+      (attachment) =>
+        attachment.type === "file" &&
+        attachment.uploadEnvironmentId === environmentId &&
+        attachment.uploadedAttachmentId === attachmentId,
+    ),
+  );
+}
+
 export async function releaseUnusedComposerAttachmentFiles(
   attachments: ReadonlyArray<DraftComposerAttachment>,
 ): Promise<void> {
@@ -305,6 +323,19 @@ export async function releaseUnusedComposerAttachmentFiles(
       .filter((attachment) => attachment.type === "file")
       .map((attachment) => attachment.fileUri),
   );
+  const uploadCandidates = new Map<EnvironmentId, Set<string>>();
+  for (const attachment of attachments) {
+    if (
+      attachment.type !== "file" ||
+      attachment.uploadEnvironmentId === undefined ||
+      attachment.uploadedAttachmentId === undefined
+    ) {
+      continue;
+    }
+    const ids = uploadCandidates.get(attachment.uploadEnvironmentId) ?? new Set<string>();
+    ids.add(attachment.uploadedAttachmentId);
+    uploadCandidates.set(attachment.uploadEnvironmentId, ids);
+  }
   if (candidates.size === 0) {
     return;
   }
@@ -323,7 +354,13 @@ export async function releaseUnusedComposerAttachmentFiles(
   }
   await flushThreadOutbox();
 
-  if ([...candidates].every(isComposerAttachmentFileReferenced)) {
+  const allFilesReferenced = [...candidates].every(isComposerAttachmentFileReferenced);
+  const allUploadsReferenced = [...uploadCandidates].every(([environmentId, attachmentIds]) =>
+    [...attachmentIds].every((attachmentId) =>
+      isComposerAttachmentUploadReferenced(environmentId, attachmentId),
+    ),
+  );
+  if (allFilesReferenced && allUploadsReferenced) {
     return;
   }
 
@@ -351,6 +388,31 @@ export async function releaseUnusedComposerAttachmentFiles(
       continue;
     }
     await removePersistedComposerAttachmentFile(fileUri);
+  }
+
+  if (uploadCandidates.size > 0) {
+    const { releasePendingAttachmentUploads } = await import("../lib/attachmentUpload");
+    for (const [environmentId, attachmentIds] of uploadCandidates) {
+      for (const attachmentId of attachmentIds) {
+        // A different draft or queued message can reuse the same pending
+        // upload with another local URI. Re-check the server-side ownership
+        // key immediately before deletion.
+        if (isComposerAttachmentUploadReferenced(environmentId, attachmentId)) {
+          continue;
+        }
+        try {
+          await releasePendingAttachmentUploads(environmentId, [attachmentId]);
+        } catch (error) {
+          // The server expires stale pending uploads. Local discard must still
+          // complete when the environment is disconnected or deletion fails.
+          console.warn("[composer-attachments] could not remove pending upload", {
+            environmentId,
+            attachmentId,
+            error,
+          });
+        }
+      }
+    }
   }
 }
 

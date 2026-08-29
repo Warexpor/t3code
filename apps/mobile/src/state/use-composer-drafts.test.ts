@@ -87,6 +87,7 @@ const composerDraftFileMocks = vi.hoisted(() => {
 
 const composerAttachmentCleanupMocks = vi.hoisted(() => ({
   remove: vi.fn(async () => undefined),
+  releaseUploads: vi.fn(async () => undefined),
 }));
 
 const incomingShareStorageMocks = vi.hoisted(() => ({
@@ -103,6 +104,10 @@ vi.mock("expo-file-system", () => ({
 
 vi.mock("../lib/composerImages", () => ({
   removePersistedComposerAttachmentFile: composerAttachmentCleanupMocks.remove,
+}));
+
+vi.mock("../lib/attachmentUpload", () => ({
+  releasePendingAttachmentUploads: composerAttachmentCleanupMocks.releaseUploads,
 }));
 
 vi.mock("../features/sharing/incoming-share-storage", () => ({
@@ -154,6 +159,8 @@ afterEach(() => {
   appAtomRegistry.set(stickyComposerModelSelectionAtom, null);
   appAtomRegistry.set(threadOutboxManager.queuedMessagesByThreadKeyAtom, {});
   composerAttachmentCleanupMocks.remove.mockClear();
+  composerAttachmentCleanupMocks.releaseUploads.mockReset();
+  composerAttachmentCleanupMocks.releaseUploads.mockResolvedValue(undefined);
   incomingShareStorageMocks.load.mockReset();
   incomingShareStorageMocks.load.mockResolvedValue([]);
 });
@@ -278,6 +285,109 @@ describe("mobile composer drafts", () => {
     appAtomRegistry.set(composerDraftsAtom, {});
     await releaseUnusedComposerAttachmentFiles([file]);
     expect(composerAttachmentCleanupMocks.remove).toHaveBeenCalledWith(file.fileUri);
+  });
+
+  it("keeps a failed-send draft's pending upload for retry", async () => {
+    const outboxLoad = vi.spyOn(threadOutboxManager, "load").mockResolvedValue(true);
+    onTestFinished(() => outboxLoad.mockRestore());
+    const file = {
+      id: "file-failed-send",
+      type: "file" as const,
+      name: "report.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 42,
+      fileUri: "file:///documents/t3-composer-attachments/failed-send.pdf",
+      uploadedAttachmentId: "pending-failed-send",
+      uploadEnvironmentId: EnvironmentId.make("environment-1"),
+    };
+    appAtomRegistry.set(composerDraftsAtom, {
+      "environment-1:thread-1": { text: "Retry this send", attachments: [file] },
+    });
+
+    await releaseUnusedComposerAttachmentFiles([file]);
+
+    expect(composerAttachmentCleanupMocks.remove).not.toHaveBeenCalled();
+    expect(composerAttachmentCleanupMocks.releaseUploads).not.toHaveBeenCalled();
+  });
+
+  it("removes an unreferenced local file and its pending upload", async () => {
+    const outboxLoad = vi.spyOn(threadOutboxManager, "load").mockResolvedValue(true);
+    onTestFinished(() => outboxLoad.mockRestore());
+    const environmentId = EnvironmentId.make("environment-1");
+    const file = {
+      id: "file-discarded",
+      type: "file" as const,
+      name: "report.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 42,
+      fileUri: "file:///documents/t3-composer-attachments/discarded.pdf",
+      uploadedAttachmentId: "pending-discarded",
+      uploadEnvironmentId: environmentId,
+    };
+
+    await releaseUnusedComposerAttachmentFiles([file]);
+
+    expect(composerAttachmentCleanupMocks.remove).toHaveBeenCalledWith(file.fileUri);
+    expect(composerAttachmentCleanupMocks.releaseUploads).toHaveBeenCalledWith(environmentId, [
+      "pending-discarded",
+    ]);
+  });
+
+  it("keeps a pending upload referenced through another local file", async () => {
+    const outboxLoad = vi.spyOn(threadOutboxManager, "load").mockResolvedValue(true);
+    onTestFinished(() => outboxLoad.mockRestore());
+    const environmentId = EnvironmentId.make("environment-1");
+    const discarded = {
+      id: "file-discarded-copy",
+      type: "file" as const,
+      name: "report.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 42,
+      fileUri: "file:///documents/t3-composer-attachments/discarded-copy.pdf",
+      uploadedAttachmentId: "pending-shared",
+      uploadEnvironmentId: environmentId,
+    };
+    const retained = {
+      ...discarded,
+      id: "file-retained-copy",
+      fileUri: "file:///documents/t3-composer-attachments/retained-copy.pdf",
+    };
+    appAtomRegistry.set(composerDraftsAtom, {
+      "environment-1:thread-1": { text: "Keep this copy", attachments: [retained] },
+    });
+
+    await releaseUnusedComposerAttachmentFiles([discarded]);
+
+    expect(composerAttachmentCleanupMocks.remove).toHaveBeenCalledWith(discarded.fileUri);
+    expect(composerAttachmentCleanupMocks.releaseUploads).not.toHaveBeenCalled();
+  });
+
+  it("completes local cleanup when pending upload deletion fails", async () => {
+    const outboxLoad = vi.spyOn(threadOutboxManager, "load").mockResolvedValue(true);
+    onTestFinished(() => outboxLoad.mockRestore());
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    onTestFinished(() => warning.mockRestore());
+    composerAttachmentCleanupMocks.releaseUploads.mockRejectedValueOnce(
+      new Error("environment disconnected"),
+    );
+    const file = {
+      id: "file-delete-failed",
+      type: "file" as const,
+      name: "report.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 42,
+      fileUri: "file:///documents/t3-composer-attachments/delete-failed.pdf",
+      uploadedAttachmentId: "pending-delete-failed",
+      uploadEnvironmentId: EnvironmentId.make("environment-1"),
+    };
+
+    await expect(releaseUnusedComposerAttachmentFiles([file])).resolves.toBeUndefined();
+
+    expect(composerAttachmentCleanupMocks.remove).toHaveBeenCalledWith(file.fileUri);
+    expect(warning).toHaveBeenCalledWith(
+      "[composer-attachments] could not remove pending upload",
+      expect.objectContaining({ attachmentId: "pending-delete-failed" }),
+    );
   });
 
   it("keeps local attachment files while an outbox message still needs them", async () => {
