@@ -2504,13 +2504,13 @@ export const stageWindowsServerSidecar = Effect.fn("stageWindowsServerSidecar")(
   }
 
   yield* Effect.log("[desktop-artifact] Installing server sidecar runtime externals...");
-  const installCommand = yield* resolveSpawnCommand("vp", [...STAGE_INSTALL_ARGS]);
+  const sidecarInstallCommand = yield* resolveSpawnCommand("pnpm", ["exec", "vp", ...STAGE_INSTALL_ARGS]);
   yield* runCommand(
-    ChildProcess.make(installCommand.command, installCommand.args, {
+    ChildProcess.make(sidecarInstallCommand.command, sidecarInstallCommand.args, {
       cwd: serverStageDir,
-      shell: installCommand.shell,
+      shell: sidecarInstallCommand.shell,
     }),
-    { label: "vp install --prod (server sidecar)", verbose: input.verbose },
+    { label: "pnpm exec vp install --prod (server sidecar)", verbose: input.verbose },
   );
 
   yield* stageWslNodePtyPrebuild({
@@ -2974,13 +2974,13 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
 
   if (!options.skipBuild) {
     yield* Effect.log("[desktop-artifact] Building desktop/server/web artifacts...");
-    const spawnCommand = yield* resolveSpawnCommand("vp", ["run", "build:desktop"]);
+    const spawnCommand = yield* resolveSpawnCommand("pnpm", ["exec", "vp", "run", "build:desktop"]);
     yield* runCommand(
       ChildProcess.make(spawnCommand.command, spawnCommand.args, {
         cwd: repoRoot,
         shell: spawnCommand.shell,
       }),
-      { label: "vp run build:desktop", verbose: options.verbose },
+      { label: "pnpm exec vp run build:desktop", verbose: options.verbose },
     );
   }
 
@@ -3227,13 +3227,13 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   }
 
   yield* Effect.log("[desktop-artifact] Installing staged production dependencies...");
-  const installCommand = yield* resolveSpawnCommand("vp", [...STAGE_INSTALL_ARGS]);
+  const installCommand = yield* resolveSpawnCommand("pnpm", ["exec", "vp", ...STAGE_INSTALL_ARGS]);
   yield* runCommand(
     ChildProcess.make(installCommand.command, installCommand.args, {
       cwd: stageAppDir,
       shell: installCommand.shell,
     }),
-    { label: "vp install --prod", verbose: options.verbose },
+    { label: "pnpm exec vp install --prod", verbose: options.verbose },
   );
   yield* stageClerkPasskeyNativeBinaries(stageAppDir, options.platform, options.arch);
 
