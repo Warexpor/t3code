@@ -2465,6 +2465,7 @@ function ChatViewContent(props: ChatViewProps) {
   useEffect(() => {
     const wasWorking = prevIsWorkingRef.current;
     prevIsWorkingRef.current = isWorking;
+    if (!settings.enableBackgroundNotifications) return;
     if (!wasWorking || isWorking) return;
     if (typeof document !== "undefined" && !document.hidden) return;
     if (typeof window === "undefined" || !("Notification" in window)) return;
@@ -2491,7 +2492,13 @@ function ChatViewContent(props: ChatViewProps) {
         if (perm === "granted") show();
       });
     }
-  }, [isWorking, activeThread?.id, activeThread?.title, activeThread?.messages]);
+  }, [
+    isWorking,
+    activeThread?.id,
+    activeThread?.title,
+    activeThread?.messages,
+    settings.enableBackgroundNotifications,
+  ]);
   useEffect(() => {
     attachmentPreviewHandoffByMessageIdRef.current = attachmentPreviewHandoffByMessageId;
   }, [attachmentPreviewHandoffByMessageId]);
@@ -7184,7 +7191,7 @@ function ChatViewContent(props: ChatViewProps) {
               />
             </div>
             {/* Visible context window bar - persistent header for Grok Build parity */}
-            {activeContextWindow ? (
+            {activeContextWindow && settings.showContextBar ? (
               <div className="sticky top-0 z-10 flex shrink-0 items-center gap-3 border-b border-border/60 bg-background/95 px-3 py-2 text-xs backdrop-blur supports-[backdrop-filter]:bg-background/80 sm:px-4">
                 <div className="flex min-w-0 flex-1 items-center gap-3">
                   <span className="shrink-0 font-medium text-muted-foreground">Context</span>

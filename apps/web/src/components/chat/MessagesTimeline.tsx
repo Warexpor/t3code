@@ -8,6 +8,7 @@ import {
 } from "@t3tools/contracts";
 import { parseScopedThreadKey } from "@t3tools/client-runtime/environment";
 import type { AgentPanelModel } from "@t3tools/client-runtime/state/subagentRuntime";
+import { useClientSettings } from "../../hooks/useSettings";
 import {
   emptyAgentPanelModel,
   formatSubagentTokenCount,
@@ -2670,6 +2671,7 @@ const PlainWorkEntryRow = memo(function PlainWorkEntryRow(props: {
 }) {
   const { workEntry, workspaceRoot, isExpandedToolGroupEntry } = props;
   const [expanded, setExpanded] = useState(false);
+  const smoothAnimations = useClientSettings((s) => s.smoothAnimations);
   const iconConfig = workToneIcon(workEntry.tone);
   const showWarningIndicator = workEntry.sourceActivityKind === "runtime.warning";
   const showFailedIndicator = workEntryDisplayIndicatesToolFailure(workEntry);
@@ -2765,22 +2767,34 @@ const PlainWorkEntryRow = memo(function PlainWorkEntryRow(props: {
         </div>
       </div>
       {canExpand && expandedBody ? (
-        <div
-          className={cn(
-            "grid transition-all duration-300 ease-out",
-            expanded ? "grid-rows-[1fr] opacity-100" : "grid-rows-[0fr] opacity-0",
-          )}
-        >
-          <div className="overflow-hidden">
+        smoothAnimations ? (
+          <div
+            className={cn(
+              "grid transition-all duration-300 ease-out",
+              expanded ? "grid-rows-[1fr] opacity-100" : "grid-rows-[0fr] opacity-0",
+            )}
+          >
+            <div className="overflow-hidden">
+              <div
+                className="mt-1 ms-7 cursor-default border-s border-border/45 ps-3 pt-1"
+                onClick={stopRowToggle}
+                onPointerDown={stopRowToggle}
+              >
+                <pre className={cn(toolCallExpandedBodyClassName, "animate-in fade-in-0 duration-300")}>{expandedBody}</pre>
+              </div>
+            </div>
+          </div>
+        ) : (
+          expanded ? (
             <div
-              className="mt-1 ms-7 cursor-default border-s border-border/45 ps-3 pt-1"
+              className="mt-1 ms-7 cursor-default border-s border-border/45 ps-3 pt-0.5"
               onClick={stopRowToggle}
               onPointerDown={stopRowToggle}
             >
-              <pre className={cn(toolCallExpandedBodyClassName, "animate-in fade-in-0 duration-300")}>{expandedBody}</pre>
+              <pre className={toolCallExpandedBodyClassName}>{expandedBody}</pre>
             </div>
-          </div>
-        </div>
+          ) : null
+        )
       ) : null}
     </div>
   );

@@ -2113,6 +2113,78 @@ export function GeneralSettingsPanel() {
         />
 
         <SettingsRow
+          {...searchableSetting("show-context-bar")}
+          description="Show the persistent context window bar above the timeline with usage, compact and details. Grok Build parity."
+          resetAction={
+            settings.showContextBar !== DEFAULT_UNIFIED_SETTINGS.showContextBar ? (
+              <SettingResetButton
+                label="context bar"
+                onClick={() =>
+                  updateSettings({ showContextBar: DEFAULT_UNIFIED_SETTINGS.showContextBar })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Switch
+              checked={settings.showContextBar}
+              onCheckedChange={(checked) => updateSettings({ showContextBar: Boolean(checked) })}
+              aria-label="Show context bar"
+            />
+          }
+        />
+
+        <SettingsRow
+          {...searchableSetting("background-notifications")}
+          description="Show an OS notification when an agent turn completes while the app is hidden or in the background."
+          resetAction={
+            settings.enableBackgroundNotifications !==
+            DEFAULT_UNIFIED_SETTINGS.enableBackgroundNotifications ? (
+              <SettingResetButton
+                label="background notifications"
+                onClick={() =>
+                  updateSettings({
+                    enableBackgroundNotifications:
+                      DEFAULT_UNIFIED_SETTINGS.enableBackgroundNotifications,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Switch
+              checked={settings.enableBackgroundNotifications}
+              onCheckedChange={(checked) =>
+                updateSettings({ enableBackgroundNotifications: Boolean(checked) })
+              }
+              aria-label="Background notifications"
+            />
+          }
+        />
+
+        <SettingsRow
+          {...searchableSetting("smooth-animations")}
+          description="Animate thinking expands and dropdowns instead of snapping. Disable to reduce motion."
+          resetAction={
+            settings.smoothAnimations !== DEFAULT_UNIFIED_SETTINGS.smoothAnimations ? (
+              <SettingResetButton
+                label="smooth animations"
+                onClick={() =>
+                  updateSettings({ smoothAnimations: DEFAULT_UNIFIED_SETTINGS.smoothAnimations })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Switch
+              checked={settings.smoothAnimations}
+              onCheckedChange={(checked) => updateSettings({ smoothAnimations: Boolean(checked) })}
+              aria-label="Smooth animations"
+            />
+          }
+        />
+
+        <SettingsRow
           {...searchableSetting("provider-update-checks")}
           description="Check installed provider CLIs for newer available versions."
           resetAction={
