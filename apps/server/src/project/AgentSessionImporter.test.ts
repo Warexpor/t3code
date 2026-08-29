@@ -12,6 +12,8 @@ import {
   type OrchestrationThread,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
@@ -29,7 +31,10 @@ import * as ThreadBackgroundLiveness from "../orchestration/ThreadBackgroundLive
 import * as ThreadPlanProgress from "../orchestration/ThreadPlanProgress.ts";
 import * as OrchestrationEngine from "../orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
-import { ProviderSessionDirectoryLive } from "../provider/Layers/ProviderSessionDirectory.ts";
+import {
+  makeProviderSessionDirectoryLive,
+  ProviderSessionDirectoryLive,
+} from "../provider/Layers/ProviderSessionDirectory.ts";
 import { ProviderSessionDirectoryPersistenceError } from "../provider/Errors.ts";
 import * as ProviderSessionDirectory from "../provider/Services/ProviderSessionDirectory.ts";
 import * as RepositoryIdentityResolver from "./RepositoryIdentityResolver.ts";
@@ -428,6 +433,7 @@ const integrationLayer = Layer.mergeAll(
     Layer.provide(OrchestrationProjectionPipelineLive),
   ),
   OrchestrationProjectionSnapshotQueryLive,
+  integrationRuntimeRepository,
   ProviderSessionDirectoryLive.pipe(Layer.provide(integrationRuntimeRepository)),
   Layer.succeed(AgentSessionScanner.AgentSessionScanner, integrationScanner),
 ).pipe(
@@ -503,6 +509,97 @@ it.layer(integrationLayer)("AgentSessionImporter integration", (it) => {
       expect(Option.getOrThrow(afterRevert).messages.map((message) => message.text)).toEqual(
         integrationThread.messages.map((message) => message.text),
       );
+    }),
+  );
+
+  it.effect("keeps a binding created while an import is in progress", () =>
+    Effect.gen(function* () {
+      const engine = yield* OrchestrationEngine.OrchestrationEngineService;
+      const snapshots = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const repository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+      const projectId = ProjectId.make("project-import-binding-race");
+      const workspaceRoot = "/tmp/project-import-binding-race";
+      const providerSessionId = "codex-binding-race";
+      const threadId = ThreadId.make(`import:codex:${providerSessionId}`);
+      const scanner = AgentSessionScanner.AgentSessionScanner.of({
+        scan: Effect.die("unused"),
+        recentThreads: () =>
+          Stream.succeed({ ...integrationThread, providerSessionId, title: "Binding race" }),
+      });
+      const importerAtBindingWrite = yield* Deferred.make<void>();
+      const releaseImporter = yield* Deferred.make<void>();
+      const importerRepository = ProviderSessionRuntime.ProviderSessionRuntimeRepository.of({
+        ...repository,
+        upsert: (runtime, options) =>
+          options?.onConflict === "ignore"
+            ? Deferred.succeed(importerAtBindingWrite, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseImporter)),
+                Effect.andThen(repository.upsert(runtime, options)),
+              )
+            : repository.upsert(runtime, options),
+      });
+      const importerDirectory = yield* ProviderSessionDirectory.ProviderSessionDirectory.pipe(
+        Effect.provide(
+          makeProviderSessionDirectoryLive().pipe(
+            Layer.provide(
+              Layer.succeed(
+                ProviderSessionRuntime.ProviderSessionRuntimeRepository,
+                importerRepository,
+              ),
+            ),
+          ),
+        ),
+      );
+
+      yield* engine.dispatch({
+        type: "project.create",
+        commandId: CommandId.make("create-import-binding-race-project"),
+        projectId,
+        title: "Binding race",
+        workspaceRoot,
+        defaultModelSelection: null,
+        createdAt: "2026-08-24T09:00:00.000Z",
+      });
+
+      const importFiber = yield* importRecentAgentThreads({ projectId }).pipe(
+        Effect.provideService(AgentSessionScanner.AgentSessionScanner, scanner),
+        Effect.provideService(ProviderSessionDirectory.ProviderSessionDirectory, importerDirectory),
+        Effect.forkChild,
+      );
+
+      yield* Effect.raceFirst(
+        Deferred.await(importerAtBindingWrite),
+        Fiber.join(importFiber).pipe(
+          Effect.flatMap((result) =>
+            Effect.die(
+              new Error(`Import completed before the binding write: ${JSON.stringify(result)}`),
+            ),
+          ),
+        ),
+      );
+      expect(
+        Option.getOrThrow(yield* snapshots.getThreadDetailById(threadId)).messages.map(
+          (message) => message.text,
+        ),
+      ).toEqual(integrationThread.messages.map((message) => message.text));
+
+      yield* directory.upsert({
+        threadId,
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        status: "running",
+        resumeCursor: { threadId: "active-client-session" },
+        runtimePayload: { cwd: workspaceRoot, activeTurnId: "turn-active" },
+      });
+      yield* Deferred.succeed(releaseImporter, undefined);
+
+      expect(yield* Fiber.join(importFiber)).toEqual({ importedCount: 1, skippedCount: 0 });
+      expect(Option.getOrThrow(yield* directory.getBinding(threadId))).toMatchObject({
+        status: "running",
+        resumeCursor: { threadId: "active-client-session" },
+        runtimePayload: { cwd: workspaceRoot, activeTurnId: "turn-active" },
+      });
     }),
   );
 });

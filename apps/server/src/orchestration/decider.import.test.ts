@@ -178,4 +178,81 @@ it.layer(NodeServices.layer)("thread history import", (it) => {
       expect(result).toMatchObject({ type: "thread.settled" });
     }),
   );
+
+  it.effect("rejects history import after a client message reaches the thread", () =>
+    Effect.gen(function* () {
+      const createdAt = "2026-08-24T10:00:00.000Z";
+      const liveMessageAt = "2026-08-24T10:02:00.000Z";
+      const threadId = ThreadId.make("import:codex:client-race");
+      const withThread = yield* projectEvent(createEmptyReadModel(createdAt), {
+        sequence: 1,
+        eventId: EventId.make("event-client-race-thread-created"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        type: "thread.created",
+        occurredAt: createdAt,
+        commandId: CommandId.make("command-client-race-thread-created"),
+        causationEventId: null,
+        correlationId: CommandId.make("command-client-race-thread-created"),
+        metadata: {},
+        payload: {
+          threadId,
+          projectId: ProjectId.make("project-1"),
+          title: "Imported thread",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+      const readModel = yield* projectEvent(withThread, {
+        sequence: 2,
+        eventId: EventId.make("event-client-race-message"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        type: "thread.message-sent",
+        occurredAt: liveMessageAt,
+        commandId: CommandId.make("command-client-race-message"),
+        causationEventId: null,
+        correlationId: CommandId.make("command-client-race-message"),
+        metadata: {},
+        payload: {
+          threadId,
+          messageId: MessageId.make("client-race-message"),
+          role: "user",
+          text: "Start live work",
+          turnId: null,
+          streaming: false,
+          createdAt: liveMessageAt,
+          updatedAt: liveMessageAt,
+        },
+      });
+
+      const error = yield* Effect.flip(
+        decideOrchestrationCommand({
+          command: {
+            type: "thread.history.import",
+            commandId: CommandId.make("command-client-race-import"),
+            threadId,
+            messages: [
+              {
+                messageId: MessageId.make(`${threadId}:000000`),
+                role: "user",
+                text: "Old work",
+                createdAt,
+              },
+            ],
+          },
+          readModel,
+        }),
+      );
+
+      expect(error._tag).toBe("OrchestrationCommandInvariantError");
+      expect(error.message).toContain("must be active and empty");
+      expect(readModel.threads[0]?.updatedAt).toBe(liveMessageAt);
+    }),
+  );
 });

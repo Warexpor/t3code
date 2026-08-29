@@ -149,18 +149,21 @@ export const importRecentAgentThreads = Effect.fn("importRecentAgentThreads")(fu
         }
 
         if (Option.isNone(existingBinding)) {
-          yield* directory.upsert({
-            threadId,
-            provider,
-            providerInstanceId: thread.providerInstanceId,
-            status: "stopped",
-            runtimeMode: DEFAULT_RUNTIME_MODE,
-            resumeCursor:
-              thread.source === "codex"
-                ? { threadId: thread.providerSessionId }
-                : { threadId, resume: thread.providerSessionId },
-            runtimePayload: { cwd: workspaceRoot },
-          });
+          yield* directory.upsert(
+            {
+              threadId,
+              provider,
+              providerInstanceId: thread.providerInstanceId,
+              status: "stopped",
+              runtimeMode: DEFAULT_RUNTIME_MODE,
+              resumeCursor:
+                thread.source === "codex"
+                  ? { threadId: thread.providerSessionId }
+                  : { threadId, resume: thread.providerSessionId },
+              runtimePayload: { cwd: workspaceRoot },
+            },
+            { onConflict: "ignore" },
+          );
         }
 
         return true;
