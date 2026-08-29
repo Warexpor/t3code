@@ -3307,12 +3307,9 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     `[desktop-artifact] Building ${options.platform}/${options.target} (arch=${options.arch}, version=${appVersion})...`,
   );
   const builderArgs = [
-    "exec",
-    "vp",
-    "exec",
     "--filter",
     "@t3tools/desktop",
-    "--",
+    "exec",
     "electron-builder",
     "--projectDir",
     stageAppDir,
