@@ -157,7 +157,15 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
           scan: Effect.die("unused"),
           recentThreads: (workspaceRoot) => {
             scannedRoot = workspaceRoot;
-            return Effect.succeed([makeThread("codex"), makeThread("claudeAgent")]);
+            return Stream.concat(
+              Stream.succeed(makeThread("codex")),
+              Stream.fromEffect(
+                Effect.sync(() => {
+                  expect(bindings).toHaveLength(1);
+                  return makeThread("claudeAgent");
+                }),
+              ),
+            );
           },
         });
         const engine = OrchestrationEngine.OrchestrationEngineService.of({
@@ -229,7 +237,7 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
         const bindings: Array<ProviderSessionDirectory.ProviderRuntimeBinding> = [];
         const scanner = AgentSessionScanner.AgentSessionScanner.of({
           scan: Effect.die("unused"),
-          recentThreads: () => Effect.succeed([makeThread("codex")]),
+          recentThreads: () => Stream.fromIterable([makeThread("codex")]),
         });
         const engine = OrchestrationEngine.OrchestrationEngineService.of({
           dispatch: (command) => {
@@ -305,7 +313,7 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
       Effect.gen(function* () {
         const scanner = AgentSessionScanner.AgentSessionScanner.of({
           scan: Effect.die("unused"),
-          recentThreads: () => Effect.succeed([makeThread("codex")]),
+          recentThreads: () => Stream.fromIterable([makeThread("codex")]),
         });
         const runningBinding: ProviderSessionDirectory.ProviderRuntimeBinding = {
           threadId: ThreadId.make("import:codex:codex-session"),
@@ -350,7 +358,7 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
         const scanner = AgentSessionScanner.AgentSessionScanner.of({
           scan: Effect.die("unused"),
           recentThreads: () =>
-            Effect.succeed([
+            Stream.fromIterable([
               { ...makeThread("claudeAgent"), providerSessionId: "not-a-uuid" },
               makeThread("codex"),
             ]),
@@ -406,7 +414,7 @@ const integrationThread = {
 };
 const integrationScanner = AgentSessionScanner.AgentSessionScanner.of({
   scan: Effect.die("unused"),
-  recentThreads: () => Effect.succeed([integrationThread]),
+  recentThreads: () => Stream.fromIterable([integrationThread]),
 });
 const integrationServerConfig = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3-agent-session-importer-test-",

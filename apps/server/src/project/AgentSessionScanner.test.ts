@@ -13,6 +13,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as ServerConfig from "../config.ts";
@@ -100,7 +101,10 @@ const runScan = (input: ScannerTestInput) =>
 const runRecentThreads = (input: ScannerTestInput & { readonly workspaceRoot: string }) =>
   Effect.gen(function* () {
     const scanner = yield* AgentSessionScanner.AgentSessionScanner;
-    return yield* scanner.recentThreads(input.workspaceRoot);
+    return yield* scanner.recentThreads(input.workspaceRoot).pipe(
+      Stream.runCollect,
+      Effect.map((threads) => Array.from(threads)),
+    );
   }).pipe(Effect.provide(makeScannerTestLayer(input)));
 
 const makeTempDir = Effect.fn("AgentSessionScanner.test.makeTempDir")(function* (prefix: string) {
@@ -874,6 +878,142 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
         });
 
         expect(threads[0]?.providerInstanceId).toBe("codex-work");
+      }),
+    );
+
+    it.effect("skips a transcript that grows after its size check", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+        yield* TestClock.setTime(nowMs);
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const workspace = yield* makeTempDir("t3code-workspace-");
+        const transcriptPath = path.join(
+          codexHomePath,
+          "sessions",
+          "2026",
+          "08",
+          "24",
+          "rollout-growing.jsonl",
+        );
+        const grownPath = path.join(codexHomePath, "grown.jsonl");
+        const contents = [
+          encodeTranscriptRecord({
+            type: "session_meta",
+            payload: { id: "growing-session", cwd: workspace },
+          }),
+          encodeTranscriptRecord({
+            type: "event_msg",
+            payload: { type: "user_message", message: "Do not import a changing file" },
+          }),
+        ].join("\n");
+        yield* writeTranscript({ filePath: transcriptPath, contents, mtimeMs: nowMs });
+        yield* writeTranscript({
+          filePath: grownPath,
+          contents: `${contents}\nchanged`,
+          mtimeMs: nowMs,
+        });
+
+        let transcriptOpenCount = 0;
+        const simulatedFileSystem = FileSystem.FileSystem.of({
+          ...fileSystem,
+          open: (filePath, options) => {
+            if (filePath !== transcriptPath) return fileSystem.open(filePath, options);
+            transcriptOpenCount += 1;
+            return fileSystem.open(transcriptOpenCount === 1 ? transcriptPath : grownPath, options);
+          },
+        });
+
+        const threads = yield* runRecentThreads({
+          claudeHomePath,
+          codexHomePath,
+          workspaceRoot: workspace,
+        }).pipe(Effect.provideService(FileSystem.FileSystem, simulatedFileSystem));
+
+        expect(transcriptOpenCount).toBe(2);
+        expect(threads).toEqual([]);
+      }),
+    );
+
+    it.effect("does not read the second transcript when the consumer takes one thread", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+        yield* TestClock.setTime(nowMs);
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const workspace = yield* makeTempDir("t3code-workspace-");
+        const makeCodexTranscript = (sessionId: string, text: string) =>
+          [
+            encodeTranscriptRecord({
+              type: "session_meta",
+              payload: { id: sessionId, cwd: workspace },
+            }),
+            encodeTranscriptRecord({
+              type: "event_msg",
+              payload: { type: "user_message", message: text },
+            }),
+          ].join("\n");
+        const olderPath = path.join(
+          codexHomePath,
+          "sessions",
+          "2026",
+          "08",
+          "23",
+          "rollout-older.jsonl",
+        );
+        const newerPath = path.join(
+          codexHomePath,
+          "sessions",
+          "2026",
+          "08",
+          "24",
+          "rollout-newer.jsonl",
+        );
+        yield* writeTranscript({
+          filePath: olderPath,
+          contents: makeCodexTranscript("older-session", "Older prompt"),
+          mtimeMs: nowMs - 1_000,
+        });
+        yield* writeTranscript({
+          filePath: newerPath,
+          contents: makeCodexTranscript("newer-session", "Newer prompt"),
+          mtimeMs: nowMs,
+        });
+
+        const openCounts = new Map<string, number>();
+        const contentReads: Array<string> = [];
+        const trackedPaths = new Set([olderPath, newerPath]);
+        const simulatedFileSystem = FileSystem.FileSystem.of({
+          ...fileSystem,
+          open: (filePath, options) => {
+            if (trackedPaths.has(filePath)) {
+              const count = (openCounts.get(filePath) ?? 0) + 1;
+              openCounts.set(filePath, count);
+              if (count === 2) contentReads.push(filePath);
+            }
+            return fileSystem.open(filePath, options);
+          },
+        });
+
+        const threads = yield* Effect.gen(function* () {
+          const scanner = yield* AgentSessionScanner.AgentSessionScanner;
+          return yield* scanner.recentThreads(workspace).pipe(
+            Stream.take(1),
+            Stream.runCollect,
+            Effect.map((items) => Array.from(items)),
+          );
+        }).pipe(
+          Effect.provide(makeScannerTestLayer({ claudeHomePath, codexHomePath })),
+          Effect.provideService(FileSystem.FileSystem, simulatedFileSystem),
+        );
+
+        expect(threads.map((thread) => thread.providerSessionId)).toEqual(["newer-session"]);
+        expect(contentReads).toEqual([newerPath]);
+        expect(openCounts.get(olderPath)).toBe(1);
       }),
     );
 

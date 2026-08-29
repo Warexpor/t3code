@@ -33,6 +33,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 
 import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { normalizeProjectPathForComparison } from "@t3tools/shared/path";
@@ -133,7 +134,7 @@ export class AgentSessionScanner extends Context.Service<
     readonly scan: Effect.Effect<AgentSessionScanResult, AgentSessionScanError>;
     readonly recentThreads: (
       workspaceRoot: string,
-    ) => Effect.Effect<ReadonlyArray<AgentSessionThread>, AgentSessionScanError>;
+    ) => Stream.Stream<AgentSessionThread, AgentSessionScanError>;
   }
 >()("t3/project/AgentSessionScanner") {}
 
@@ -452,6 +453,45 @@ export const make = Effect.gen(function* () {
                 const cwd = extractCwd(line.trim());
                 if (cwd !== null) return cwd;
               }
+            }
+
+            return null;
+          }),
+        ),
+      ),
+    ).pipe(Effect.orElseSucceed(() => null));
+  });
+
+  /**
+   * Read one stable transcript snapshot. The guard byte detects a file that
+   * grew after stat without reading past the hard per-file limit.
+   */
+  const readTranscript = Effect.fn("AgentSessionScanner.readTranscript")(function* (
+    filePath: string,
+    expectedSize: bigint,
+  ) {
+    if (expectedSize > BigInt(MAX_IMPORTED_TRANSCRIPT_BYTES)) return null;
+    const expectedBytes = Number(expectedSize);
+
+    return yield* Effect.scoped(
+      fileSystem.open(filePath, { flag: "r" }).pipe(
+        Effect.flatMap((file) =>
+          Effect.gen(function* () {
+            const decoder = new TextDecoder();
+            let contents = "";
+            let bytesRead = 0;
+
+            while (bytesRead <= expectedBytes) {
+              const next = yield* file.readAlloc(
+                Math.min(TRANSCRIPT_PREFIX_BYTES, expectedBytes + 1 - bytesRead),
+              );
+              if (Option.isNone(next)) {
+                return contents + decoder.decode();
+              }
+
+              bytesRead += next.value.byteLength;
+              if (bytesRead > expectedBytes) return null;
+              contents += decoder.decode(next.value, { stream: true });
             }
 
             return null;
@@ -818,20 +858,22 @@ export const make = Effect.gen(function* () {
     };
   });
 
-  const recentThreads: AgentSessionScanner["Service"]["recentThreads"] = Effect.fn(
-    "AgentSessionScanner.recentThreads",
-  )(function* (workspaceRoot) {
+  const prepareRecentThreads = Effect.fn("AgentSessionScanner.prepareRecentThreads")(function* (
+    workspaceRoot: string,
+  ) {
     const root = path.resolve(expandHomePath(workspaceRoot));
     const realRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
-    if (isExcludedProjectPath(root) || isExcludedProjectPath(realRoot)) return [];
+    if (isExcludedProjectPath(root) || isExcludedProjectPath(realRoot)) return Stream.empty;
     const normalizedRoot = normalizeProjectPathForComparison(realRoot);
     const cutoffMs = DateTime.toEpochMillis(yield* DateTime.now) - RECENT_THREAD_WINDOW_MS;
-    const threads: Array<AgentSessionThread> = [];
-    const importedSessions = new Set<string>();
 
     const candidates = cachedCandidates ?? (yield* collectCandidates());
     cachedCandidates = candidates;
 
+    const eligibleTranscripts: Array<{
+      readonly candidate: RawCandidate;
+      readonly transcript: RawCandidate["transcripts"][number] & { readonly mtimeMs: number };
+    }> = [];
     for (const candidate of candidates) {
       const expanded = expandHomePath(candidate.cwd.trim());
       if (!path.isAbsolute(expanded)) continue;
@@ -843,41 +885,60 @@ export const make = Effect.gen(function* () {
 
       for (const transcript of candidate.transcripts) {
         if (transcript.mtimeMs === null || transcript.mtimeMs < cutoffMs) continue;
-        const stats = yield* statOption(transcript.filePath);
-        if (Option.isNone(stats) || stats.value.size > BigInt(MAX_IMPORTED_TRANSCRIPT_BYTES)) {
-          continue;
-        }
-        const contents = yield* fileSystem
-          .readFileString(transcript.filePath)
-          .pipe(Effect.map(Option.some), Effect.orElseSucceed(Option.none));
-        if (Option.isNone(contents)) continue;
-
-        const primaryInstanceId = candidate.providerInstanceIds[0];
-        if (primaryInstanceId === undefined) continue;
-        const parsedThread = parseAgentSessionTranscript({
-          contents: contents.value,
-          source: candidate.source,
-          providerInstanceId: primaryInstanceId,
-          fallbackSessionId: path.basename(transcript.filePath, ".jsonl"),
-          lastActiveAtMs: transcript.mtimeMs,
+        eligibleTranscripts.push({
+          candidate,
+          transcript: { ...transcript, mtimeMs: transcript.mtimeMs },
         });
-        if (parsedThread === null) continue;
-        for (const providerInstanceId of candidate.providerInstanceIds) {
-          const thread =
-            providerInstanceId === primaryInstanceId
-              ? parsedThread
-              : { ...parsedThread, providerInstanceId };
-          const sessionKey = `${thread.providerInstanceId}\0${thread.providerSessionId}`;
-          if (importedSessions.has(sessionKey)) continue;
-          importedSessions.add(sessionKey);
-          threads.push(thread);
-        }
       }
     }
 
-    threads.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
-    return threads;
+    eligibleTranscripts.sort((left, right) => {
+      if (left.transcript.mtimeMs !== right.transcript.mtimeMs) {
+        return right.transcript.mtimeMs - left.transcript.mtimeMs;
+      }
+      return left.transcript.filePath.localeCompare(right.transcript.filePath);
+    });
+
+    const importedSessions = new Set<string>();
+    return Stream.fromIteratorSucceed(eligibleTranscripts.values(), 1).pipe(
+      Stream.mapEffect(({ candidate, transcript }) =>
+        Effect.gen(function* () {
+          const stats = yield* statOption(transcript.filePath);
+          if (Option.isNone(stats)) return [];
+          const contents = yield* readTranscript(transcript.filePath, stats.value.size);
+          if (contents === null) return [];
+
+          const primaryInstanceId = candidate.providerInstanceIds[0];
+          if (primaryInstanceId === undefined) return [];
+          const parsedThread = parseAgentSessionTranscript({
+            contents,
+            source: candidate.source,
+            providerInstanceId: primaryInstanceId,
+            fallbackSessionId: path.basename(transcript.filePath, ".jsonl"),
+            lastActiveAtMs: transcript.mtimeMs,
+          });
+          if (parsedThread === null) return [];
+
+          const threads: Array<AgentSessionThread> = [];
+          for (const providerInstanceId of candidate.providerInstanceIds) {
+            const thread =
+              providerInstanceId === primaryInstanceId
+                ? parsedThread
+                : { ...parsedThread, providerInstanceId };
+            const sessionKey = `${thread.providerInstanceId}\0${thread.providerSessionId}`;
+            if (importedSessions.has(sessionKey)) continue;
+            importedSessions.add(sessionKey);
+            threads.push(thread);
+          }
+          return threads;
+        }),
+      ),
+      Stream.flatMap(Stream.fromIterable),
+    );
   });
+
+  const recentThreads: AgentSessionScanner["Service"]["recentThreads"] = (workspaceRoot) =>
+    Stream.unwrap(prepareRecentThreads(workspaceRoot));
 
   return AgentSessionScanner.of({ scan, recentThreads });
 });
