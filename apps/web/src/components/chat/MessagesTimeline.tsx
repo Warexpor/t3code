@@ -2764,13 +2764,22 @@ const PlainWorkEntryRow = memo(function PlainWorkEntryRow(props: {
           </span>
         </div>
       </div>
-      {expanded && canExpand && expandedBody ? (
+      {canExpand && expandedBody ? (
         <div
-          className="mt-1 ms-7 cursor-default border-s border-border/45 ps-3 pt-0.5"
-          onClick={stopRowToggle}
-          onPointerDown={stopRowToggle}
+          className={cn(
+            "grid transition-all duration-300 ease-out",
+            expanded ? "grid-rows-[1fr] opacity-100" : "grid-rows-[0fr] opacity-0",
+          )}
         >
-          <pre className={toolCallExpandedBodyClassName}>{expandedBody}</pre>
+          <div className="overflow-hidden">
+            <div
+              className="mt-1 ms-7 cursor-default border-s border-border/45 ps-3 pt-1"
+              onClick={stopRowToggle}
+              onPointerDown={stopRowToggle}
+            >
+              <pre className={cn(toolCallExpandedBodyClassName, "animate-in fade-in-0 duration-300")}>{expandedBody}</pre>
+            </div>
+          </div>
         </div>
       ) : null}
     </div>
