@@ -3,7 +3,7 @@ import type { ExpoConfig } from "expo/config";
 import { BRAND_ASSET_PATHS } from "../../scripts/lib/brand-assets.ts";
 import { loadRepoEnv } from "../../scripts/lib/public-config.ts";
 
-type AppVariant = "development" | "preview" | "production";
+type AppVariant = "development" | "preview" | "production" | "warexpor";
 
 const repoEnv = loadRepoEnv();
 Object.assign(process.env, repoEnv);
@@ -87,6 +87,14 @@ const VARIANT_CONFIG = {
     relyingParty: "clerk.t3.codes",
     assets: RELEASE_ASSETS,
   },
+  warexpor: {
+    appName: "T3 Code Warexpor",
+    scheme: "t3code-warexpor",
+    iosBundleIdentifier: "com.t3tools.t3code.warexpor",
+    androidPackage: "com.t3tools.t3code.warexpor",
+    relyingParty: "clerk.t3.codes",
+    assets: RELEASE_ASSETS,
+  },
 } as const;
 
 function resolveAppVariant(value: string | undefined): AppVariant {
@@ -94,6 +102,7 @@ function resolveAppVariant(value: string | undefined): AppVariant {
     case "development":
     case "preview":
     case "production":
+    case "warexpor":
       return value;
     default:
       return "production";
