@@ -1,5 +1,7 @@
 import { resolveAssetUrl } from "@t3tools/client-runtime/state/assets";
 import {
+  clampFileAttachmentUploadBytes,
+  fileAttachmentTooLargeMessage,
   isAssetAttachmentNotFoundFailure,
   runAttachmentUploadCycle,
   verifyPersistedAttachmentUpload,
@@ -29,6 +31,29 @@ import { toUploadChatImageAttachments, type DraftComposerAttachment } from "./co
  * release files through `releaseUnusedComposerAttachmentFiles`.
  */
 export type UploadedMobileAttachment = UploadChatImageAttachment | ChatFileAttachment;
+
+export function validateDraftFileAttachments(input: {
+  readonly attachments: ReadonlyArray<DraftComposerAttachment>;
+  readonly serverConfig: {
+    readonly environment: {
+      readonly capabilities: {
+        readonly attachmentUploads?: boolean;
+        readonly fileAttachments?: { readonly maxUploadBytes: number };
+      };
+    };
+  } | null;
+}): string | null {
+  const files = input.attachments.filter((attachment) => attachment.type === "file");
+  if (files.length === 0) return null;
+  if (input.serverConfig === null) return "Server attachment support is still loading.";
+  const capabilities = input.serverConfig.environment.capabilities;
+  if (capabilities.attachmentUploads !== true || capabilities.fileAttachments === undefined) {
+    return "This server does not support file attachments.";
+  }
+  const maxBytes = clampFileAttachmentUploadBytes(capabilities.fileAttachments.maxUploadBytes);
+  const oversized = files.find((attachment) => attachment.sizeBytes > maxBytes);
+  return oversized ? fileAttachmentTooLargeMessage(oversized.name, maxBytes) : null;
+}
 
 /** Keep uploaded file ids on durable drafts so a later send can reuse their bytes. */
 export function withUploadedMobileAttachmentReferences(input: {

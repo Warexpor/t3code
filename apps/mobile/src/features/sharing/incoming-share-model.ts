@@ -138,6 +138,41 @@ export function selectIncomingShareAttachments(input: {
   return { attachments, warnings };
 }
 
+export function selectIncomingShareAttachmentsForServer(input: {
+  readonly attachments: ReadonlyArray<DraftComposerAttachment>;
+  readonly serverConfig: {
+    readonly environment: {
+      readonly capabilities: {
+        readonly attachmentUploads?: boolean;
+        readonly fileAttachments?: { readonly maxUploadBytes: number };
+      };
+    };
+  } | null;
+}):
+  | { readonly status: "pending" }
+  | {
+      readonly status: "ready";
+      readonly attachments: ReadonlyArray<DraftComposerAttachment>;
+      readonly warnings: ReadonlyArray<string>;
+    } {
+  const hasFiles = input.attachments.some((attachment) => attachment.type === "file");
+  if (hasFiles && input.serverConfig === null) {
+    return { status: "pending" };
+  }
+  const capabilities = input.serverConfig?.environment.capabilities;
+  const maxFileAttachmentBytes =
+    capabilities?.attachmentUploads === true
+      ? (capabilities.fileAttachments?.maxUploadBytes ?? null)
+      : null;
+  return {
+    status: "ready",
+    ...selectIncomingShareAttachments({
+      attachments: input.attachments,
+      maxFileAttachmentBytes,
+    }),
+  };
+}
+
 function sharedText(payloads: ReadonlyArray<SharePayload>): string {
   const seen = new Set<string>();
   const values: string[] = [];
@@ -270,6 +305,7 @@ export async function buildIncomingShareDraft(input: {
         continue;
       }
       let persistedFileUri: string | undefined;
+      let retainedFileUri: string | undefined;
       try {
         let sizeBytes = resolved?.contentSize ?? (await input.fileReader.readSize?.(uri)) ?? null;
         if (
@@ -329,6 +365,7 @@ export async function buildIncomingShareDraft(input: {
           sizeBytes,
           fileUri: persistedFileUri ?? uri,
         });
+        retainedFileUri = persistedFileUri ?? uri;
       } catch (error) {
         warnings.push(error instanceof Error ? error.message : `Could not read '${name}'.`);
         // A copy persisted before the failure has no attachment referencing
@@ -337,7 +374,10 @@ export async function buildIncomingShareDraft(input: {
           await releaseOwnedFiles(input.fileReader, [persistedFileUri]);
         }
       } finally {
-        await releaseOwnedFiles(input.fileReader, [uri, payload.value]);
+        await releaseOwnedFiles(
+          input.fileReader,
+          [uri, payload.value].filter((candidate) => candidate !== retainedFileUri),
+        );
       }
       continue;
     }

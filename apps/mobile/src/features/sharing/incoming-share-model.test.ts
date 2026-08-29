@@ -11,6 +11,7 @@ import {
   hasIncomingShareContent,
   isShareFileUriUnderOwnedRoots,
   selectIncomingShareAttachments,
+  selectIncomingShareAttachmentsForServer,
 } from "./incoming-share-model";
 
 describe("incoming native shares", () => {
@@ -110,7 +111,7 @@ describe("incoming native shares", () => {
     };
     const readBase64 = vi.fn(async () => "unused");
     const persistFile = vi.fn(async () => "file:///documents/report.pdf");
-    const removeOwnedFile = vi.fn(async () => undefined);
+    const removeOwnedFile = vi.fn(async (_uri: string) => undefined);
 
     const result = await buildIncomingShareDraft({
       id: "share-report",
@@ -355,6 +356,60 @@ describe("incoming native shares", () => {
     ]);
   });
 
+  it("keeps a no-copy file source that the returned attachment still owns", async () => {
+    const sourceUri = "file:///documents/report.pdf";
+    const removeOwnedFile = vi.fn(async () => undefined);
+
+    const result = await buildIncomingShareDraft({
+      id: "share-no-copy",
+      createdAt: "2026-07-15T10:00:00.000Z",
+      payloads: [{ shareType: "file", value: sourceUri, mimeType: "application/pdf" }],
+      resolvedPayloads: [],
+      fileReader: {
+        readBase64: async () => "unused",
+        readSize: async () => 42,
+        removeOwnedFile,
+      },
+    });
+
+    expect(result.attachments[0]).toMatchObject({ type: "file", fileUri: sourceUri });
+    expect(removeOwnedFile).not.toHaveBeenCalled();
+  });
+
+  it("keeps a persisted copy and releases distinct temporary source URIs", async () => {
+    const payloadUri = "content://shared/report";
+    const resolvedUri = "file:///cache/report.pdf";
+    const persistedUri = "file:///documents/report.pdf";
+    const removeOwnedFile = vi.fn(async (_uri: string) => undefined);
+
+    const result = await buildIncomingShareDraft({
+      id: "share-copy",
+      createdAt: "2026-07-15T10:00:00.000Z",
+      payloads: [{ shareType: "file", value: payloadUri, mimeType: "application/pdf" }],
+      resolvedPayloads: [
+        {
+          shareType: "file",
+          value: payloadUri,
+          mimeType: "application/pdf",
+          contentUri: resolvedUri,
+          contentType: "file",
+          contentMimeType: "application/pdf",
+          contentSize: 42,
+          originalName: "report.pdf",
+        },
+      ],
+      fileReader: {
+        readBase64: async () => "unused",
+        readSize: async () => 42,
+        persistFile: async () => persistedUri,
+        removeOwnedFile,
+      },
+    });
+
+    expect(result.attachments[0]).toMatchObject({ type: "file", fileUri: persistedUri });
+    expect(removeOwnedFile.mock.calls.map(([uri]) => uri)).toEqual([resolvedUri, payloadUri]);
+  });
+
   it("keeps images and rejects shared files on servers without file support", () => {
     const image = {
       id: "image-1",
@@ -404,6 +459,53 @@ describe("incoming native shares", () => {
       attachments: [],
       warnings: ["'report.pdf' exceeds the 5 MB attachment limit."],
     });
+  });
+
+  it("uses current server support and limits when selecting a reserved share", () => {
+    const file = {
+      id: "file-1",
+      type: "file" as const,
+      name: "report.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 6 * 1024 * 1024,
+      fileUri: "file:///documents/report.pdf",
+    };
+
+    expect(
+      selectIncomingShareAttachmentsForServer({ attachments: [file], serverConfig: null }),
+    ).toEqual({ status: "pending" });
+    expect(
+      selectIncomingShareAttachmentsForServer({
+        attachments: [file],
+        serverConfig: { environment: { capabilities: { attachmentUploads: true } } },
+      }),
+    ).toMatchObject({ status: "ready", attachments: [] });
+    expect(
+      selectIncomingShareAttachmentsForServer({
+        attachments: [file],
+        serverConfig: {
+          environment: {
+            capabilities: {
+              attachmentUploads: true,
+              fileAttachments: { maxUploadBytes: 5 * 1024 * 1024 },
+            },
+          },
+        },
+      }),
+    ).toMatchObject({ status: "ready", attachments: [] });
+    expect(
+      selectIncomingShareAttachmentsForServer({
+        attachments: [file],
+        serverConfig: {
+          environment: {
+            capabilities: {
+              attachmentUploads: true,
+              fileAttachments: { maxUploadBytes: 10 * 1024 * 1024 },
+            },
+          },
+        },
+      }),
+    ).toMatchObject({ status: "ready", attachments: [file] });
   });
 
   it("releases every temporary file when a share exceeds the attachment limit", async () => {

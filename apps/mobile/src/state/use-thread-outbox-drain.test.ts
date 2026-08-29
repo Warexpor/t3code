@@ -1,4 +1,11 @@
-import { CommandId, EnvironmentId, MessageId, ThreadId } from "@t3tools/contracts";
+import {
+  CommandId,
+  EnvironmentId,
+  MessageId,
+  ProjectId,
+  ProviderInstanceId,
+  ThreadId,
+} from "@t3tools/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import type { PreparedTurnAttachments } from "../lib/attachmentUpload";
@@ -489,6 +496,36 @@ describe("thread outbox delivered creation recovery", () => {
 });
 
 describe("thread outbox recovery rollback", () => {
+  it("restores a rejected new task into its durable project draft", async () => {
+    const message: QueuedThreadMessage = {
+      ...queuedMessage({ messageId: "message-creation-restore", text: "new task text" }),
+      modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.6-sol" },
+      creation: {
+        projectId: ProjectId.make("project-1"),
+        workspaceMode: "local",
+        branch: null,
+        worktreePath: null,
+      },
+    };
+    await harness.manager.enqueue(message);
+
+    await expect(restoreRejectedQueuedMessage(message, "rejected by server")).resolves.toBe(
+      "restored",
+    );
+
+    expect(
+      composerDrafts.getComposerDraftSnapshot(
+        `new-task:${message.environmentId}:${message.creation!.projectId}`,
+      ),
+    ).toMatchObject({
+      text: message.text,
+      attachments: message.attachments,
+      modelSelection: message.modelSelection,
+    });
+    expect(remainingMessages()).toEqual([]);
+    expect(harness.setPendingConnectionError).toHaveBeenCalledWith("rejected by server");
+  });
+
   it("rolls a failed recovery merge back so the retry cannot duplicate the text", async () => {
     const message = queuedMessage({ messageId: "message-restore", text: "queued text" });
     const draftKey = `${message.environmentId}:${message.threadId}`;

@@ -170,12 +170,10 @@ function isQueuedMessagePayloadCurrent(
 }
 
 /**
- * Removes a delivered message from the outbox. Revision-checked with
- * `deliveryRevision` (read when the delivered payload was fixed): an edit
- * accepted while the turn was in flight stays queued and keeps the pending
- * uploads it references, and the false return makes the drain schedule a
- * retry pass that delivers the newer payload instead of silently dropping it
- * with the old one. Exported for tests.
+ * Removes a delivered message from the outbox. The revision and editor checks
+ * preserve a creation payload when its pending-task editor owns newer work.
+ * The outcome tells the caller whether removal completed, ownership changed,
+ * or storage cleanup failed. Exported for tests.
  */
 export async function completeQueuedMessageDelivery(
   queuedMessage: QueuedThreadMessage,
@@ -569,42 +567,36 @@ export function useThreadOutboxDrain(): void {
     const reportFailure = (
       commandResult: AtomCommandResult<unknown, unknown>,
       stage: ThreadOutboxCommandStage,
-    ): boolean => {
+    ): { readonly action: "retry" | "restore"; readonly message: string } | null => {
       if (!AsyncResult.isFailure(commandResult)) {
-        return false;
+        return null;
       }
+      const error = Cause.squash(commandResult.cause);
       const action = resolveThreadOutboxFailureAction({
         stage,
-        error: Cause.squash(commandResult.cause),
+        error,
         interrupted: Cause.hasInterruptsOnly(commandResult.cause),
       });
-      const retry = action === "retry";
       console.warn("[thread-outbox] queued message delivery failed", {
         environmentId: queuedMessage.environmentId,
         threadId: queuedMessage.threadId,
         messageId: queuedMessage.messageId,
         stage,
         cause: commandResult.cause,
-        retry,
+        action,
       });
-      return retry;
+      return {
+        action,
+        message: error instanceof Error ? error.message : "The message could not be sent.",
+      };
     };
-    const completeDelivery = async (
-      deliveryResult: AtomCommandResult<unknown, unknown>,
-      deliveryRevision: number,
-    ): Promise<boolean> => {
-      if (reportFailure(deliveryResult, "start-turn")) {
-        return false;
-      }
-      return (await completeQueuedMessageDelivery(queuedMessage, deliveryRevision)) === "removed";
-    };
-    return { reportFailure, completeDelivery };
+    return { reportFailure };
   }, []);
 
   const sendQueuedMessage = useCallback(
     async (queuedMessage: QueuedThreadMessage, thread: EnvironmentThreadShell) => {
       const settings = resolveQueuedThreadSettings(queuedMessage, thread);
-      const { reportFailure, completeDelivery } = makeDeliveryHelpers(queuedMessage);
+      const { reportFailure } = makeDeliveryHelpers(queuedMessage);
 
       if (!modelSelectionsEqual(settings.modelSelection, thread.modelSelection)) {
         const updateResult = await updateThreadMetadata({
@@ -701,7 +693,15 @@ export function useThreadOutboxDrain(): void {
           createdAt: queuedMessage.createdAt,
         },
       });
-      const delivered = await completeDelivery(deliveryResult, deliveryRevision);
+      const failure = reportFailure(deliveryResult, "start-turn");
+      if (failure?.action === "retry") {
+        return false;
+      }
+      if (failure?.action === "restore") {
+        return restoreQueuedMessage(persistedMessage, failure.message);
+      }
+      const delivered =
+        (await completeQueuedMessageDelivery(persistedMessage, deliveryRevision)) === "removed";
       if (delivered) {
         // The delivered turn holds its own copy of the bytes. A failed delete
         // is surfaced (never fails the delivered turn); the server also
@@ -786,10 +786,14 @@ export function useThreadOutboxDrain(): void {
         }),
       });
       const { reportFailure } = makeDeliveryHelpers(queuedMessage);
-      if (reportFailure(deliveryResult, "start-turn")) {
+      const failure = reportFailure(deliveryResult, "start-turn");
+      if (failure?.action === "retry") {
         return false;
       }
-      const outcome = await completeQueuedMessageDelivery(queuedMessage, deliveryRevision);
+      if (failure?.action === "restore") {
+        return restoreQueuedMessage(persistedMessage, failure.message);
+      }
+      const outcome = await completeQueuedMessageDelivery(persistedMessage, deliveryRevision);
       if (outcome === "edited") {
         if (appAtomRegistry.get(editingQueuedMessageIdsAtom)[queuedMessage.messageId]) {
           // The editor holds the entry with unsaved edits; merging the queue
@@ -799,7 +803,7 @@ export function useThreadOutboxDrain(): void {
         }
         // The thread exists now, so the next drain would remove the edited
         // payload as a duplicate creation. Hand it to the thread's composer.
-        return recoverEditedCreationAfterDelivery(queuedMessage);
+        return recoverEditedCreationAfterDelivery(persistedMessage);
       }
       if (outcome === "removed") {
         await prepared.releaseUploads().catch((error) => {

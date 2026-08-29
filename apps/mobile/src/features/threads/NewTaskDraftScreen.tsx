@@ -74,7 +74,9 @@ import {
   resolveNewTaskWorkspaceLabel,
 } from "./new-task-context-presentation";
 import { useIncomingShare } from "../sharing/IncomingShareProvider";
-import { selectIncomingShareAttachments } from "../sharing/incoming-share-model";
+import { selectIncomingShareAttachmentsForServer } from "../sharing/incoming-share-model";
+import { appAtomRegistry } from "../../state/atom-registry";
+import { serverEnvironment } from "../../state/server";
 
 function NewTaskWorkspaceIcon(props: {
   readonly workspaceMode: "local" | "worktree";
@@ -487,12 +489,6 @@ export function NewTaskDraftScreen(props: {
     activeShareImportTokenRef.current = importToken;
     setImportingShareKey(importKey);
     void (async () => {
-      const selectedAttachments = selectIncomingShareAttachments({
-        attachments: incomingShare.attachments,
-        maxFileAttachmentBytes:
-          selectedEnvironmentServerConfig?.environment.capabilities.fileAttachments
-            ?.maxUploadBytes ?? null,
-      });
       await reserveShare(shareId, {
         environmentId: String(destinationProject.environmentId),
         projectId: String(destinationProject.id),
@@ -505,6 +501,15 @@ export function NewTaskDraftScreen(props: {
         latestIncomingShareIdRef.current !== shareId
       ) {
         return;
+      }
+      const selectedAttachments = selectIncomingShareAttachmentsForServer({
+        attachments: incomingShare.attachments,
+        serverConfig: appAtomRegistry.get(
+          serverEnvironment.configValueAtom(destinationProject.environmentId),
+        ),
+      });
+      if (selectedAttachments.status === "pending") {
+        throw new Error("Server attachment support is still loading.");
       }
       needsDraftRestore = true;
       const { skippedAttachmentCount } = await mergeComposerDraftContent(draftKey, {

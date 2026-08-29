@@ -15,7 +15,7 @@ import { AsyncResult } from "effect/unstable/reactivity";
 
 import { threadEnvironment } from "../../state/threads";
 import type { DraftComposerAttachment } from "../../lib/composerImages";
-import { prepareTurnAttachments } from "../../lib/attachmentUpload";
+import { prepareTurnAttachments, validateDraftFileAttachments } from "../../lib/attachmentUpload";
 import { makeTurnCommandMetadata, type TurnCommandMetadata } from "../../lib/commandMetadata";
 import { buildProjectThreadStartTurnInput } from "../../lib/projectThreadStartTurn";
 import { randomHex } from "../../lib/uuid";
@@ -23,6 +23,8 @@ import { useAtomCommand } from "../../state/use-atom-command";
 import { scheduleUnusedComposerAttachmentCleanup } from "../../state/use-composer-drafts";
 import { setPendingConnectionError } from "../../state/use-remote-environment-registry";
 import { validateProjectThreadCreation } from "./projectThreadCreationValidation";
+import { appAtomRegistry } from "../../state/atom-registry";
+import { serverEnvironment } from "../../state/server";
 
 export function useCreateProjectThread() {
   const startTurn = useAtomCommand(threadEnvironment.startTurn, { reportFailure: false });
@@ -61,6 +63,21 @@ export function useCreateProjectThread() {
         return AsyncResult.failure(Cause.fail(validationError));
       }
 
+      const validateLiveFileAttachments = (
+        attachments: ReadonlyArray<DraftComposerAttachment>,
+      ): string | null =>
+        validateDraftFileAttachments({
+          attachments,
+          serverConfig: appAtomRegistry.get(
+            serverEnvironment.configValueAtom(input.project.environmentId),
+          ),
+        });
+      const initialAttachmentError = validateLiveFileAttachments(input.initialAttachments);
+      if (initialAttachmentError !== null) {
+        setPendingConnectionError(initialAttachmentError);
+        return AsyncResult.failure(Cause.fail(new Error(initialAttachmentError)));
+      }
+
       let prepared: Awaited<ReturnType<typeof prepareTurnAttachments>>;
       try {
         // If persisting the references into the draft throws, the owner call
@@ -82,6 +99,12 @@ export function useCreateProjectThread() {
         const message = "The attachments are no longer available.";
         setPendingConnectionError(message);
         return AsyncResult.failure(Cause.fail(new Error(message)));
+      }
+
+      const preparedAttachmentError = validateLiveFileAttachments(prepared.draftAttachments);
+      if (preparedAttachmentError !== null) {
+        setPendingConnectionError(preparedAttachmentError);
+        return AsyncResult.failure(Cause.fail(new Error(preparedAttachmentError)));
       }
 
       const result = await startTurn({

@@ -255,7 +255,7 @@ export function shouldRetryThreadOutboxDelivery(error: unknown): boolean {
 }
 
 export type ThreadOutboxCommandStage = "settings-sync" | "start-turn";
-export type ThreadOutboxFailureAction = "retry" | "discard";
+export type ThreadOutboxFailureAction = "retry" | "restore";
 
 export function resolveThreadOutboxFailureAction(input: {
   readonly stage: ThreadOutboxCommandStage;
@@ -269,5 +269,5 @@ export function resolveThreadOutboxFailureAction(input: {
   ) {
     return "retry";
   }
-  return "discard";
+  return "restore";
 }
