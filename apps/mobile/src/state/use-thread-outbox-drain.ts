@@ -1020,10 +1020,9 @@ export function useThreadOutboxDrain(): void {
         if (appAtomRegistry.get(editingQueuedMessageIdsAtom)[nextQueuedMessage.messageId]) {
           return true;
         }
-        // The shell state is equally stale: a thread that vanished or went
-        // busy during the await must not receive this dispatch, and a
-        // creation whose thread appeared must be removed, not re-sent. Defer
-        // and let the next pass re-resolve the delivery action.
+        // The shell state is equally stale. Re-run the same delivery policy
+        // against the live thread snapshot so a vanished thread or newly
+        // created target defers, while busy existing threads can still steer.
         if (deliveryAction === "send") {
           const liveThread = findThread(
             appAtomRegistry.get(environmentThreadShells.threadShellsAtom),
@@ -1031,11 +1030,14 @@ export function useThreadOutboxDrain(): void {
           );
           const liveThreadBusy =
             liveThread?.session?.status === "running" || liveThread?.session?.status === "starting";
-          if (
-            creation === undefined
-              ? liveThread === undefined || liveThreadBusy
-              : liveThread !== undefined
-          ) {
+          const liveDeliveryAction = resolveThreadOutboxDeliveryAction({
+            isCreation: creation !== undefined,
+            threadExists: liveThread !== undefined,
+            shellStatus,
+            environmentConnected: environment?.connectionState === "connected",
+            threadBusy: liveThreadBusy,
+          });
+          if (liveDeliveryAction !== "send") {
             return true;
           }
         }
