@@ -20,6 +20,7 @@ import {
 } from "./filesystem.ts";
 import {
   AgentSessionImportInput,
+  AgentSessionImportProjectNotFoundError,
   AgentSessionImportResult,
   AgentSessionScanInput,
   AgentSessionScanResult,
@@ -695,7 +696,11 @@ export const WsAgentSessionsScanRpc = Rpc.make(WS_METHODS.agentSessionsScan, {
 export const WsAgentSessionsImportRpc = Rpc.make(WS_METHODS.agentSessionsImport, {
   payload: AgentSessionImportInput,
   success: AgentSessionImportResult,
-  error: Schema.Union([AgentSessionScanError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    AgentSessionImportProjectNotFoundError,
+    AgentSessionScanError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 export const WsAssetsCreateUrlRpc = Rpc.make(WS_METHODS.assetsCreateUrl, {

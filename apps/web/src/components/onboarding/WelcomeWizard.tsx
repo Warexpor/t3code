@@ -11,7 +11,7 @@ import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
-import { ThreadId } from "@t3tools/contracts";
+import { CommandId, ThreadId } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import {
   ArrowRightIcon,
@@ -32,7 +32,10 @@ import { useLocalStorage } from "../../hooks/useLocalStorage";
 import { hasCloudPublicConfig } from "../../cloud/publicConfig";
 import { useT3ConnectAuthPrompt } from "../clerk/useT3ConnectAuthPrompt";
 import { useCompleteOnboarding } from "../../onboarding/firstRun";
-import { partitionOnboardingProjects } from "../../onboarding/projectImport.logic";
+import {
+  partitionOnboardingProjects,
+  resolveOnboardingProjectId,
+} from "../../onboarding/projectImport.logic";
 import {
   getOnboardingProviderState,
   selectOnboardingProvidersByDriver,
@@ -42,6 +45,7 @@ import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { newProjectId, randomUUID } from "../../lib/utils";
 import { resolveDefaultProviderModelSelection } from "../../providerInstances";
 import { agentSessionImport, agentSessionScan } from "../../state/agentSessions";
+import { useProjects } from "../../state/entities";
 import { useEnvironments, usePrimaryEnvironment } from "../../state/environments";
 import { useEnvironmentQuery } from "../../state/query";
 import { projectEnvironment } from "../../state/projects";
@@ -910,13 +914,18 @@ function ImportStep({
   );
   const createProject = useAtomCommand(projectEnvironment.create, { reportFailure: false });
   const importThreads = useAtomCommand(agentSessionImport, { reportFailure: false });
+  const projects = useProjects();
   const [choosing, setChoosing] = useState(false);
   const [deselected, setDeselected] = useState<ReadonlySet<string>>(new Set());
   const [isImporting, setIsImporting] = useState(false);
   const [importError, setImportError] = useState("");
-  // Keep created projects separate from completed imports so history failures can retry.
+  // Keep project creation attempts separate from completed history imports so both can retry.
   const importedPathsRef = useRef(new Set<string>());
-  const createdProjectIdsRef = useRef(new Map<string, ProjectId>());
+  const projectsRef = useRef(projects);
+  projectsRef.current = projects;
+  const projectAttemptsRef = useRef(
+    new Map<string, { readonly projectId: ProjectId; readonly commandId: CommandId }>(),
+  );
   const importGenerationRef = useRef(0);
 
   // Candidate paths are per-environment; a target switch would otherwise
@@ -927,17 +936,16 @@ function ImportStep({
     setIsImporting(false);
     setImportError("");
     importedPathsRef.current = new Set();
-    createdProjectIdsRef.current = new Map();
+    projectAttemptsRef.current = new Map();
     return () => {
       importGenerationRef.current += 1;
     };
   }, [environmentId]);
 
-  const {
-    available: candidates,
-    recent,
-    alreadyImportedCount,
-  } = useMemo(() => partitionOnboardingProjects(scan.data?.candidates ?? []), [scan.data]);
+  const { available: candidates, recent } = useMemo(
+    () => partitionOnboardingProjects(scan.data?.candidates ?? []),
+    [scan.data],
+  );
   const older = candidates.length - recent.length;
 
   const runImport = async (selection: ReadonlyArray<AgentSessionProjectCandidate>) => {
@@ -949,7 +957,7 @@ function ImportStep({
     setImportError("");
     const importGeneration = importGenerationRef.current;
     const importedPaths = importedPathsRef.current;
-    const createdProjectIds = createdProjectIdsRef.current;
+    const projectAttempts = projectAttemptsRef.current;
     const defaultModelSelection = resolveDefaultProviderModelSelection(providers ?? [], null);
     // Interrupted imports are neither failures nor successes — the command was
     // superseded or the environment dropped — but they still didn't land, so
@@ -968,13 +976,28 @@ function ImportStep({
         return;
       }
       if (importedPaths.has(candidate.path)) continue;
-      let projectId = createdProjectIds.get(candidate.path);
-      if (projectId === undefined) {
-        projectId = newProjectId();
+      let projectId = resolveOnboardingProjectId(
+        projectsRef.current,
+        environmentId,
+        candidate.path,
+        candidate.projectId,
+      );
+      if (projectId === null) {
+        let attempt = projectAttempts.get(candidate.path);
+        if (attempt === undefined) {
+          const nextProjectId = newProjectId();
+          attempt = {
+            projectId: nextProjectId,
+            commandId: CommandId.make(`onboarding:project:create:${nextProjectId}`),
+          };
+          projectAttempts.set(candidate.path, attempt);
+        }
+        projectId = attempt.projectId;
         const result = await createProject({
           environmentId,
           input: {
             projectId,
+            commandId: attempt.commandId,
             title: candidate.title,
             workspaceRoot: candidate.path,
             createWorkspaceRootIfMissing: false,
@@ -987,13 +1010,15 @@ function ImportStep({
         ) {
           return;
         }
-        if (result._tag !== "Success") continue;
-        createdProjectIds.set(candidate.path, projectId);
+        if (result._tag !== "Success") {
+          if (!isAtomCommandInterrupted(result)) projectAttempts.delete(candidate.path);
+          continue;
+        }
       }
 
       const threadImportResult = await importThreads({
         environmentId,
-        input: { projectId, workspaceRoot: candidate.path },
+        input: { projectId },
       });
       if (
         importGeneration !== importGenerationRef.current ||
@@ -1007,14 +1032,19 @@ function ImportStep({
       ) {
         imported += 1;
         importedPaths.add(candidate.path);
+      } else if (
+        threadImportResult._tag !== "Success" &&
+        !isAtomCommandInterrupted(threadImportResult)
+      ) {
+        projectAttempts.delete(candidate.path);
       }
     }
     setIsImporting(false);
     if (imported < selection.length) {
       setImportError(
         imported === 0
-          ? "Import failed. You can add projects manually from the command palette."
-          : `Imported ${imported} of ${selection.length} projects. The rest can be added from the command palette.`,
+          ? "Could not import thread history. Retry, or continue without it."
+          : `Imported thread history for ${imported} of ${selection.length} projects. Retry, or continue without the rest.`,
       );
       return;
     }
@@ -1044,28 +1074,32 @@ function ImportStep({
         description={
           scan.error !== null
             ? "Could not check this computer for projects."
-            : alreadyImportedCount > 0
-              ? "Your existing projects are already in T3 Code."
-              : "No existing Claude Code or Codex projects found."
+            : "No existing Claude Code or Codex projects found."
         }
         onBack={onBack}
       >
         {scan.error !== null ? (
           <p className="mt-3 text-xs text-white/50">You can add projects later.</p>
         ) : null}
-        <div className="mt-6 flex justify-end">
-          <Button onClick={onDone}>Start coding</Button>
+        <div className="mt-6 flex justify-end gap-2">
+          {scan.error !== null ? (
+            <Button variant="ghost" onClick={scan.refresh}>
+              Retry
+            </Button>
+          ) : null}
+          <Button onClick={onDone}>{scan.error !== null ? "Skip" : "Start coding"}</Button>
         </div>
       </StepShell>
     );
   }
 
   if (choosing) {
-    const selectedCount = candidates.length - deselected.size;
+    const selected = candidates.filter((candidate) => !deselected.has(candidate.path));
     return (
       <StepShell
         title="Choose your projects"
         onBack={() => setChoosing(false)}
+        backDisabled={isImporting}
         description={`${candidates.length} found on ${machineLabel}.`}
       >
         <div className="mt-6 max-h-72 overflow-x-hidden overflow-y-auto border-y border-white/12">
@@ -1104,12 +1138,10 @@ function ImportStep({
             Skip
           </Button>
           <Button
-            disabled={isImporting || selectedCount === 0}
-            onClick={() =>
-              void runImport(candidates.filter((candidate) => !deselected.has(candidate.path)))
-            }
+            disabled={isImporting || selected.length === 0}
+            onClick={() => void runImport(selected)}
           >
-            {isImporting ? "Importing..." : `Import ${selectedCount}`}
+            {isImporting ? "Importing..." : `Import ${selected.length}`}
           </Button>
         </div>
       </StepShell>
@@ -1121,6 +1153,7 @@ function ImportStep({
       title="Your recent projects"
       description={`${recent.length} ${recent.length === 1 ? "project" : "projects"} found on ${machineLabel}.${older > 0 ? ` ${older} older available.` : ""}`}
       onBack={onBack}
+      backDisabled={isImporting}
     >
       <div className="mt-6 border-y border-white/12">
         {recent.slice(0, 4).map((candidate) => (
@@ -1170,11 +1203,13 @@ function StepShell({
   title,
   description,
   onBack,
+  backDisabled = false,
   children,
 }: {
   readonly title: string;
   readonly description?: string;
   readonly onBack?: () => void;
+  readonly backDisabled?: boolean;
   readonly children?: React.ReactNode;
 }) {
   return (
@@ -1182,6 +1217,7 @@ function StepShell({
       {onBack ? (
         <Button
           className="mb-5 -ml-2 text-white/55 hover:text-white"
+          disabled={backDisabled}
           onClick={onBack}
           size="xs"
           variant="ghost-muted"

@@ -83,6 +83,8 @@ const TranscriptRecord = Schema.Struct({
   sessionId: Schema.optional(Schema.String),
   aiTitle: Schema.optional(Schema.String),
   isSidechain: Schema.optional(Schema.Boolean),
+  isMeta: Schema.optional(Schema.Boolean),
+  isCompactSummary: Schema.optional(Schema.Boolean),
   message: Schema.optional(TranscriptMessage),
   payload: Schema.optional(
     Schema.Struct({
@@ -171,16 +173,16 @@ function normalizeTimestamp(value: string | undefined, fallback: string): string
   return Option.isSome(parsed) ? DateTime.formatIso(parsed.value) : fallback;
 }
 
-/** Codex records injected workspace context as user input even though it is not conversation text. */
+const LEADING_CODEX_CONTEXT =
+  /^\s*(?:<environment_context>[\s\S]*?<\/environment_context>|<user_instructions>[\s\S]*?<\/user_instructions>|# AGENTS\.md instructions for[^\r\n]*\s*<INSTRUCTIONS>[\s\S]*?<\/INSTRUCTIONS>)\s*/u;
+
+/** Codex records leading workspace context as user input even though it is not conversation text. */
 function visibleCodexUserText(value: string): string {
-  return value
-    .replaceAll(/<environment_context>[\s\S]*?<\/environment_context>/gu, "")
-    .replaceAll(/<user_instructions>[\s\S]*?<\/user_instructions>/gu, "")
-    .replaceAll(
-      /# AGENTS\.md instructions for[^\r\n]*\s*<INSTRUCTIONS>[\s\S]*?<\/INSTRUCTIONS>/gu,
-      "",
-    )
-    .trim();
+  let visible = value;
+  while (LEADING_CODEX_CONTEXT.test(visible)) {
+    visible = visible.replace(LEADING_CODEX_CONTEXT, "");
+  }
+  return visible.replace(/^\s*## My request for Codex:\s*/u, "").trim();
 }
 
 /** Keep visible user and assistant text while ignoring tools, reasoning, and malformed records. */
@@ -192,11 +194,37 @@ export function parseAgentSessionTranscript(input: {
   readonly lastActiveAtMs: number;
 }): AgentSessionThread | null {
   const fallbackTimestamp = DateTime.formatIso(DateTime.makeUnsafe(input.lastActiveAtMs));
-  let providerSessionId = input.fallbackSessionId;
+  // Claude filenames are session IDs. Codex rollout filenames include extra
+  // timestamp text, so only transcript metadata can provide a resumable ID.
+  let providerSessionId = input.source === "codex" ? "" : input.fallbackSessionId;
   let title: string | null = null;
   let model: string | null = null;
-  let hasExplicitCodexUserMessages = false;
+  let hasCodexSessionId = false;
   const messages: Array<AgentSessionThreadMessage & { readonly codexResponseUser: boolean }> = [];
+  let firstUserMessage:
+    | (AgentSessionThreadMessage & { readonly codexResponseUser: boolean })
+    | undefined;
+
+  const retainMessage = (
+    message: AgentSessionThreadMessage & { readonly codexResponseUser: boolean },
+  ) => {
+    if (firstUserMessage === undefined && message.role === "user") {
+      firstUserMessage = message;
+    }
+    messages.push(message);
+    if (messages.length > MAX_IMPORTED_MESSAGES) messages.shift();
+  };
+
+  const hasMatchingCodexEventInTurn = (text: string) => {
+    for (let index = messages.length - 1; index >= 0; index--) {
+      const message = messages[index];
+      if (message?.role === "assistant") return false;
+      if (message?.role === "user" && !message.codexResponseUser && message.text === text) {
+        return true;
+      }
+    }
+    return false;
+  };
 
   for (const line of input.contents.split("\n")) {
     const decoded = decodeTranscriptRecord(line);
@@ -204,16 +232,26 @@ export function parseAgentSessionTranscript(input: {
     const record = decoded.value;
 
     if (input.source === "claudeAgent") {
+      if (
+        record.isSidechain === true ||
+        record.isMeta === true ||
+        record.isCompactSummary === true
+      ) {
+        continue;
+      }
       if (record.sessionId?.trim()) providerSessionId = record.sessionId.trim();
       if (record.aiTitle?.trim()) title = record.aiTitle.trim();
-      if (record.message?.model?.trim()) model = record.message.model.trim();
-      if (record.isSidechain === true || (record.type !== "user" && record.type !== "assistant")) {
+      const messageModel = record.message?.model?.trim();
+      // Claude uses this sentinel for local error responses. It is not a
+      // model ID that can be selected when the imported session resumes.
+      if (messageModel && messageModel !== "<synthetic>") model = messageModel;
+      if (record.type !== "user" && record.type !== "assistant") {
         continue;
       }
 
       const text = extractText(record.message?.content);
       if (text.length === 0) continue;
-      messages.push({
+      retainMessage({
         role: record.type,
         text,
         createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
@@ -223,8 +261,11 @@ export function parseAgentSessionTranscript(input: {
     }
 
     if (record.type === "session_meta") {
-      providerSessionId =
-        record.payload?.id?.trim() || record.payload?.session_id?.trim() || providerSessionId;
+      const sessionId = record.payload?.id?.trim() || record.payload?.session_id?.trim();
+      if (!hasCodexSessionId && sessionId) {
+        providerSessionId = sessionId;
+        hasCodexSessionId = true;
+      }
       continue;
     }
     if (record.type === "turn_context" && record.payload?.model?.trim()) {
@@ -234,8 +275,18 @@ export function parseAgentSessionTranscript(input: {
     if (record.type === "event_msg" && record.payload?.type === "user_message") {
       const text = visibleCodexUserText(record.payload.message ?? "");
       if (text.length === 0) continue;
-      hasExplicitCodexUserMessages = true;
-      messages.push({
+      // Codex can write the same prompt as both a response item and an event.
+      // Remove only the matching response copy so mixed-format logs keep every
+      // distinct user message.
+      for (let index = messages.length - 1; index >= 0; index--) {
+        const message = messages[index];
+        if (message?.role === "assistant") break;
+        if (message?.codexResponseUser === true && message.text === text) {
+          messages.splice(index, 1);
+          break;
+        }
+      }
+      retainMessage({
         role: "user",
         text,
         createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
@@ -255,7 +306,10 @@ export function parseAgentSessionTranscript(input: {
     const text =
       record.payload.role === "user" ? visibleCodexUserText(extractedText) : extractedText;
     if (text.length === 0) continue;
-    messages.push({
+    if (record.payload.role === "user" && hasMatchingCodexEventInTurn(text)) {
+      continue;
+    }
+    retainMessage({
       role: record.payload.role,
       text,
       createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
@@ -263,21 +317,23 @@ export function parseAgentSessionTranscript(input: {
     });
   }
 
-  const visibleMessages = messages
-    .filter((message) => !hasExplicitCodexUserMessages || !message.codexResponseUser)
-    .map(({ codexResponseUser: _codexResponseUser, ...message }) => message);
-  const firstUserMessage = visibleMessages.find((message) => message.role === "user");
+  const visibleMessages = messages.map(
+    ({ codexResponseUser: _codexResponseUser, ...message }) => message,
+  );
   if (providerSessionId.trim().length === 0 || firstUserMessage === undefined) return null;
-  const latestMessages = visibleMessages.slice(-MAX_IMPORTED_MESSAGES);
-  const retainedMessages = latestMessages.some((message) => message.role === "user")
-    ? latestMessages
-    : [firstUserMessage, ...latestMessages.slice(-(MAX_IMPORTED_MESSAGES - 1))];
+  const { codexResponseUser: _codexResponseUser, ...visibleFirstUserMessage } = firstUserMessage;
+  const retainedMessages = visibleMessages.some((message) => message.role === "user")
+    ? visibleMessages
+    : [visibleFirstUserMessage, ...visibleMessages.slice(-(MAX_IMPORTED_MESSAGES - 1))];
 
   return {
     source: input.source,
     providerInstanceId: input.providerInstanceId,
     providerSessionId,
-    title: title ?? firstUserMessage.text.split("\n")[0]?.slice(0, 100).trim() ?? "Imported thread",
+    title:
+      title ??
+      visibleFirstUserMessage.text.split("\n")[0]?.slice(0, 100).trim() ??
+      "Imported thread",
     model,
     createdAt: retainedMessages[0]?.createdAt ?? fallbackTimestamp,
     updatedAt: fallbackTimestamp,
@@ -720,9 +776,10 @@ export const make = Effect.gen(function* () {
           (cause) => new AgentSessionScanError({ operation: "read-projects", cause }),
         ),
       );
-    const importedRoots = new Set(
-      shellSnapshot.projects.map((project) =>
-        normalizeProjectPathForComparison(project.workspaceRoot),
+    const importedProjectsByRoot = new Map(
+      shellSnapshot.projects.map(
+        (project) =>
+          [normalizeProjectPathForComparison(project.workspaceRoot), project.id] as const,
       ),
     );
 
@@ -730,19 +787,20 @@ export const make = Effect.gen(function* () {
     for (const [key, entry] of merged.entries()) {
       // Projects may have been created under either the recorded spelling or
       // the resolved realpath (e.g. a symlinked home) — check both.
-      const alreadyImported =
-        importedRoots.has(normalizeProjectPathForComparison(entry.path)) ||
-        importedRoots.has(normalizeProjectPathForComparison(key));
+      const projectId =
+        importedProjectsByRoot.get(normalizeProjectPathForComparison(entry.path)) ??
+        importedProjectsByRoot.get(normalizeProjectPathForComparison(key));
       candidates.push({
         path: entry.path,
         title: path.basename(entry.path) || entry.path,
+        ...(projectId === undefined ? {} : { projectId }),
         sources: entry.sources,
         threadCount: entry.threadCount,
         lastActiveAt:
           entry.lastActiveAtMs === null
             ? null
             : DateTime.formatIso(DateTime.makeUnsafe(entry.lastActiveAtMs)),
-        alreadyImported,
+        alreadyImported: projectId !== undefined,
       });
     }
 
@@ -765,6 +823,7 @@ export const make = Effect.gen(function* () {
   )(function* (workspaceRoot) {
     const root = path.resolve(expandHomePath(workspaceRoot));
     const realRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
+    if (isExcludedProjectPath(root) || isExcludedProjectPath(realRoot)) return [];
     const normalizedRoot = normalizeProjectPathForComparison(realRoot);
     const cutoffMs = DateTime.toEpochMillis(yield* DateTime.now) - RECENT_THREAD_WINDOW_MS;
     const threads: Array<AgentSessionThread> = [];

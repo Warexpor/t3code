@@ -18,7 +18,7 @@ it.layer(NodeServices.layer)("thread history import", (it) => {
   it.effect("emits completed user and assistant messages without starting a turn", () =>
     Effect.gen(function* () {
       const createdAt = "2026-08-24T10:00:00.000Z";
-      const threadId = ThreadId.make("thread-imported");
+      const threadId = ThreadId.make("import:codex:session-1");
       const readModel = yield* projectEvent(createEmptyReadModel(createdAt), {
         sequence: 1,
         eventId: EventId.make("event-thread-created"),
@@ -51,13 +51,13 @@ it.layer(NodeServices.layer)("thread history import", (it) => {
           threadId,
           messages: [
             {
-              messageId: MessageId.make("message-user"),
+              messageId: MessageId.make(`${threadId}:000000`),
               role: "user",
               text: "Fix the bug",
               createdAt,
             },
             {
-              messageId: MessageId.make("message-assistant"),
+              messageId: MessageId.make(`${threadId}:000001`),
               role: "assistant",
               text: "Fixed",
               createdAt: "2026-08-24T10:01:00.000Z",
@@ -78,6 +78,38 @@ it.layer(NodeServices.layer)("thread history import", (it) => {
           metadata: { historyImport: true },
           payload: { role: "assistant", text: "Fixed", turnId: null, streaming: false },
         },
+        {
+          type: "thread.settled",
+          metadata: { historyImport: true },
+          occurredAt: "2026-08-24T10:01:00.000Z",
+          payload: {
+            settledAt: "2026-08-24T10:01:00.000Z",
+            updatedAt: "2026-08-24T10:01:00.000Z",
+          },
+        },
+      ]);
+
+      let projected = readModel;
+      const plannedEvents = Array.isArray(events) ? events : [events];
+      for (const [index, event] of plannedEvents.entries()) {
+        projected = yield* projectEvent(projected, { ...event, sequence: index + 2 });
+      }
+      projected = yield* projectEvent(projected, {
+        sequence: 5,
+        eventId: EventId.make("event-import-reverted"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        type: "thread.reverted",
+        occurredAt: "2026-08-24T10:02:00.000Z",
+        commandId: CommandId.make("command-import-reverted"),
+        causationEventId: null,
+        correlationId: CommandId.make("command-import-reverted"),
+        metadata: {},
+        payload: { threadId, turnCount: 0 },
+      });
+      expect(projected.threads[0]?.messages.map((message) => message.text)).toEqual([
+        "Fix the bug",
+        "Fixed",
       ]);
     }),
   );

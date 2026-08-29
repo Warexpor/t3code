@@ -25,6 +25,7 @@ export type AgentSessionScanInput = typeof AgentSessionScanInput.Type;
 export const AgentSessionProjectCandidate = Schema.Struct({
   path: TrimmedNonEmptyString,
   title: TrimmedNonEmptyString,
+  projectId: Schema.optional(ProjectId),
   sources: Schema.Array(AgentSessionSource),
   threadCount: NonNegativeInt,
   lastActiveAt: Schema.NullOr(IsoDateTime),
@@ -40,9 +41,17 @@ export type AgentSessionScanResult = typeof AgentSessionScanResult.Type;
 
 export const AgentSessionImportInput = Schema.Struct({
   projectId: ProjectId,
-  workspaceRoot: TrimmedNonEmptyString,
 });
 export type AgentSessionImportInput = typeof AgentSessionImportInput.Type;
+
+export class AgentSessionImportProjectNotFoundError extends Schema.TaggedErrorClass<AgentSessionImportProjectNotFoundError>()(
+  "AgentSessionImportProjectNotFoundError",
+  { projectId: ProjectId },
+) {
+  override get message(): string {
+    return `Project '${this.projectId}' does not exist.`;
+  }
+}
 
 export const AgentSessionImportResult = Schema.Struct({
   importedCount: NonNegativeInt,

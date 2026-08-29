@@ -2009,6 +2009,11 @@ const makeWsRpcLayer = (
                 orchestrationEngine,
               ),
               Effect.provideService(
+                ProjectionSnapshotQuery.ProjectionSnapshotQuery,
+                projectionSnapshotQuery,
+              ),
+              Effect.provideService(Crypto.Crypto, crypto),
+              Effect.provideService(
                 ProviderSessionDirectory.ProviderSessionDirectory,
                 providerSessionDirectory,
               ),
