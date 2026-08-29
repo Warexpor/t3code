@@ -2460,6 +2460,38 @@ function ChatViewContent(props: ChatViewProps) {
     localDispatchStartedAt,
     latestUserMessageAt,
   );
+  // Background notification when a turn completes while the app is hidden
+  const prevIsWorkingRef = useRef(false);
+  useEffect(() => {
+    const wasWorking = prevIsWorkingRef.current;
+    prevIsWorkingRef.current = isWorking;
+    if (!wasWorking || isWorking) return;
+    if (typeof document !== "undefined" && !document.hidden) return;
+    if (typeof window === "undefined" || !("Notification" in window)) return;
+    if (Notification.permission === "denied") return;
+    const threadTitle = activeThread?.title ?? "T3 Code";
+    const lastAssistant = activeThread?.messages.findLast((m) => m.role === "assistant");
+    const snippet = lastAssistant?.content?.slice(0, 120) ?? "Agent finished";
+    const body = snippet.length > 120 ? `${snippet.slice(0, 117)}...` : snippet;
+    const show = () => {
+      try {
+        const n = new Notification(threadTitle, { body, tag: activeThread?.id });
+        n.onclick = () => {
+          window.focus();
+          n.close();
+        };
+      } catch {
+        // ignore notification errors
+      }
+    };
+    if (Notification.permission === "granted") {
+      show();
+    } else {
+      void Notification.requestPermission().then((perm) => {
+        if (perm === "granted") show();
+      });
+    }
+  }, [isWorking, activeThread?.id, activeThread?.title, activeThread?.messages]);
   useEffect(() => {
     attachmentPreviewHandoffByMessageIdRef.current = attachmentPreviewHandoffByMessageId;
   }, [attachmentPreviewHandoffByMessageId]);
