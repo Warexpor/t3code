@@ -133,6 +133,7 @@ import {
   completeQueuedMessageDelivery,
   prepareQueuedMessageAttachments,
   recoverEditedCreationAfterDelivery,
+  removeAcknowledgedExistingThreadMessage,
   restoreRejectedQueuedMessage,
 } from "./use-thread-outbox-drain";
 
@@ -320,6 +321,25 @@ describe("thread outbox attachment preparation", () => {
 });
 
 describe("thread outbox drain delivery cleanup", () => {
+  it("retries only cleanup after an acknowledged send removal fails", async () => {
+    const message = queuedMessage({ messageId: "message-acknowledged", text: "delivered" });
+    const acknowledged = new Set([message.messageId]);
+    harness.removeOutboxMessage.mockRejectedValueOnce(new Error("storage unavailable"));
+    await harness.manager.enqueue(message);
+
+    await expect(removeAcknowledgedExistingThreadMessage(message, acknowledged)).resolves.toBe(
+      false,
+    );
+    expect(remainingMessages()).toEqual([message]);
+    expect(acknowledged).toEqual(new Set([message.messageId]));
+
+    await expect(removeAcknowledgedExistingThreadMessage(message, acknowledged)).resolves.toBe(
+      true,
+    );
+    expect(remainingMessages()).toEqual([]);
+    expect(acknowledged).toEqual(new Set());
+  });
+
   it("keeps an edited message and its files when delivery cleanup loses the revision race", async () => {
     const message = queuedMessage({
       messageId: "message-edited",

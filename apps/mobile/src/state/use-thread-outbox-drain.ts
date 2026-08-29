@@ -215,6 +215,28 @@ export async function completeQueuedMessageDelivery(
   }
 }
 
+/** Retries local cleanup for an existing-thread send acknowledged in this drain lifetime. */
+export async function removeAcknowledgedExistingThreadMessage(
+  queuedMessage: QueuedThreadMessage,
+  acknowledgedMessageIds: Set<MessageId>,
+): Promise<boolean> {
+  try {
+    const removed = await removeThreadOutboxMessage(queuedMessage);
+    if (removed) {
+      acknowledgedMessageIds.delete(queuedMessage.messageId);
+    }
+    return removed;
+  } catch (error) {
+    console.warn("[thread-outbox] failed to remove acknowledged queued message", {
+      environmentId: queuedMessage.environmentId,
+      threadId: queuedMessage.threadId,
+      messageId: queuedMessage.messageId,
+      error,
+    });
+    return false;
+  }
+}
+
 /**
  * A creation delivered its startTurn but an edit won the cleanup race, so the
  * edited payload is still queued. The next drain would see the created thread
@@ -485,6 +507,7 @@ export function useThreadOutboxDrain(): void {
   const retryAttemptRef = useRef(new Map<MessageId, number>());
   const retryNotBeforeRef = useRef(new Map<MessageId, number>());
   const retryTimersRef = useRef(new Map<MessageId, ReturnType<typeof setTimeout>>());
+  const acknowledgedExistingThreadMessageIdsRef = useRef(new Set<MessageId>());
   const blockedRecoverySubscriptionsRef = useRef(
     new Map<
       MessageId,
@@ -700,9 +723,11 @@ export function useThreadOutboxDrain(): void {
       if (failure?.action === "restore") {
         return restoreQueuedMessage(persistedMessage, failure.message);
       }
+      acknowledgedExistingThreadMessageIdsRef.current.add(persistedMessage.messageId);
       const delivered =
         (await completeQueuedMessageDelivery(persistedMessage, deliveryRevision)) === "removed";
       if (delivered) {
+        acknowledgedExistingThreadMessageIdsRef.current.delete(persistedMessage.messageId);
         // The delivered turn holds its own copy of the bytes. A failed delete
         // is surfaced (never fails the delivered turn); the server also
         // expires leaked pending uploads.
@@ -821,10 +846,49 @@ export function useThreadOutboxDrain(): void {
       return;
     }
 
+    const queuedMessageIds = new Set(
+      Object.values(queuedMessagesByThreadKey)
+        .flat()
+        .map((message) => message.messageId),
+    );
+    for (const messageId of acknowledgedExistingThreadMessageIdsRef.current) {
+      if (!queuedMessageIds.has(messageId)) {
+        acknowledgedExistingThreadMessageIdsRef.current.delete(messageId);
+      }
+    }
+
     for (const [threadKey, queuedMessages] of Object.entries(queuedMessagesByThreadKey)) {
       const nextQueuedMessage = queuedMessages[0];
       if (!nextQueuedMessage) {
         continue;
+      }
+      if (
+        nextQueuedMessage.creation === undefined &&
+        acknowledgedExistingThreadMessageIdsRef.current.has(nextQueuedMessage.messageId)
+      ) {
+        if ((retryNotBeforeRef.current.get(nextQueuedMessage.messageId) ?? 0) > Date.now()) {
+          continue;
+        }
+        beginDispatchingQueuedMessage(nextQueuedMessage.messageId);
+        void removeAcknowledgedExistingThreadMessage(
+          nextQueuedMessage,
+          acknowledgedExistingThreadMessageIdsRef.current,
+        )
+          .then((removed) => {
+            if (!removed) {
+              scheduleQueuedMessageRetry(nextQueuedMessage.messageId);
+              return;
+            }
+            retryAttemptRef.current.delete(nextQueuedMessage.messageId);
+            retryNotBeforeRef.current.delete(nextQueuedMessage.messageId);
+            const pendingTimer = retryTimersRef.current.get(nextQueuedMessage.messageId);
+            if (pendingTimer !== undefined) {
+              clearTimeout(pendingTimer);
+              retryTimersRef.current.delete(nextQueuedMessage.messageId);
+            }
+          })
+          .finally(() => finishDispatchingQueuedMessage(nextQueuedMessage.messageId));
+        return;
       }
       if (editingQueuedMessageIds[nextQueuedMessage.messageId]) {
         continue;
