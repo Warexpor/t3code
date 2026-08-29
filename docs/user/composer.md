@@ -14,6 +14,19 @@ On mobile, the model picker shows each OpenCode model's upstream provider, such 
 GitHub Copilot, or OpenCode Zen, beneath its name. Search by that provider name to narrow the list
 when starting a thread or changing an existing thread's model.
 
+## Voice input on iPhone
+
+On supported iPhones with iOS 26 or later, tap the microphone in the composer to record a message.
+Tap the checkmark to finish. T3 Code transcribes the recording on the device and inserts the text at
+the selection where recording started. If the keyboard is open when you start, it stays open during
+voice input. You can review and edit the text before you send it.
+
+The first use can download Apple's speech model and needs a network connection. Later transcription
+works offline for that language. A recording can be up to five minutes long. Canceling voice input,
+leaving the screen, or an audio interruption discards the new recording and keeps the existing draft
+and attachments. T3 Code deletes the local audio file after transcription or cancellation. It sends
+only the normal message text when you submit the draft.
+
 ## Commands and skills
 
 Type `/` to open the command menu. Type `$` to find and add a skill. Skill rows show their source,
