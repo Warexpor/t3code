@@ -4895,12 +4895,12 @@ function ChatViewContent(props: ChatViewProps) {
     activeThread && activeContextWindow
       ? `${activeThread.id}:${activeContextWindow.updatedAt}`
       : null;
+  const canCompactForProvider = compactionProviderAvailable || activeContextWindow !== null;
   const compactDisabled =
     !activeThread ||
     !activeProject ||
     !isServerThread ||
-    selectedProvider !== "claudeAgent" ||
-    !compactionProviderAvailable ||
+    !canCompactForProvider ||
     isWorking ||
     threadDetailLoading ||
     isPreparingWorktree ||
@@ -4915,8 +4915,10 @@ function ChatViewContent(props: ChatViewProps) {
       ? "Send or clear your draft before compacting"
       : !activeProject
         ? "Choose a project before compacting"
-        : !compactionProviderAvailable
-          ? "Enable a Claude provider before compacting"
+        : !canCompactForProvider
+          ? activeContextWindow
+            ? "Compacting is unavailable right now"
+            : "Enable a Claude provider before compacting"
           : "Compacting is unavailable right now"
     : null;
   const resumeCompactionBannerItem = useMemo<ComposerBannerStackItem | null>(() => {
@@ -5682,6 +5684,50 @@ function ChatViewContent(props: ChatViewProps) {
         : null;
     if (standaloneSlashCommand) {
       handleInteractionModeChange(standaloneSlashCommand);
+      promptRef.current = "";
+      clearComposerDraftContent(composerDraftTarget);
+      composerRef.current?.resetCursorState();
+      return;
+    }
+    // Grok Build parity: /context shows the visible context window without sending to the provider
+    const lowerTrimmed = trimmed.toLowerCase();
+    if (lowerTrimmed === "/context" || lowerTrimmed.startsWith("/context ")) {
+      if (!activeContextWindow) {
+        toastManager.add(
+          stackedThreadToast({
+            type: "info",
+            title: "No context window yet",
+            description: "Send a message first. The provider reports context usage after its first turn.",
+          }),
+        );
+      } else {
+        const u = activeContextWindow;
+        toastManager.add(
+          stackedThreadToast({
+            type: "info",
+            title: `Context ${u.usedPercentage !== null ? `${Math.round(u.usedPercentage)}%` : formatContextWindowTokens(u.usedTokens)}`,
+            description: `Used ${formatContextWindowTokens(u.usedTokens)}${u.maxTokens ? ` / ${formatContextWindowTokens(u.maxTokens)}` : ""}${u.totalProcessedTokens ? ` · total ${formatContextWindowTokens(u.totalProcessedTokens)}` : ""}${u.remainingTokens !== null ? ` · ${formatContextWindowTokens(u.remainingTokens)} remaining` : ""}${u.compactsAutomatically && u.autoCompactThreshold ? ` · auto-compacts at ${u.autoCompactThreshold.toLocaleString()}` : ""}`,
+          }),
+        );
+      }
+      promptRef.current = "";
+      clearComposerDraftContent(composerDraftTarget);
+      composerRef.current?.resetCursorState();
+      return;
+    }
+    // Route /compact through the compact flow even when the provider slash command list does not include it
+    if (lowerTrimmed === "/compact" || lowerTrimmed.startsWith("/compact ")) {
+      if (compactDisabled) {
+        toastManager.add(
+          stackedThreadToast({
+            type: "warning",
+            title: "Cannot compact now",
+            description: compactDisabledReason ?? "Compacting is unavailable right now",
+          }),
+        );
+      } else {
+        composerRef.current?.compactContext();
+      }
       promptRef.current = "";
       clearComposerDraftContent(composerDraftTarget);
       composerRef.current?.resetCursorState();
@@ -7105,6 +7151,56 @@ function ChatViewContent(props: ChatViewProps) {
                 onDismiss={() => setDismissedProviderStatusBannerKey(providerStatusBannerKey)}
               />
             </div>
+            {/* Visible context window bar - persistent header for Grok Build parity */}
+            {activeContextWindow ? (
+              <div className="sticky top-0 z-10 flex shrink-0 items-center gap-3 border-b border-border/60 bg-background/95 px-3 py-2 text-xs backdrop-blur supports-[backdrop-filter]:bg-background/80 sm:px-4">
+                <div className="flex min-w-0 flex-1 items-center gap-3">
+                  <span className="shrink-0 font-medium text-muted-foreground">Context</span>
+                  <div className="h-1.5 min-w-20 flex-1 max-w-[240px] overflow-hidden rounded-full bg-muted/60 sm:max-w-[320px]">
+                    <div
+                      className="h-full rounded-full transition-[width,background-color] duration-500"
+                      style={{
+                        width: `${Math.max(0, Math.min(100, activeContextWindow.usedPercentage ?? 0))}%`,
+                        backgroundColor:
+                          (activeContextWindow.usedPercentage ?? 0) > 90
+                            ? "var(--color-error)"
+                            : "var(--color-muted-foreground)",
+                      }}
+                    />
+                  </div>
+                  <span className="shrink-0 tabular-nums text-secondary-label">
+                    {activeContextWindow.maxTokens !== null && activeContextWindow.usedPercentage !== null
+                      ? `${formatContextWindowTokens(activeContextWindow.usedTokens)}/${formatContextWindowTokens(activeContextWindow.maxTokens)} · ${Math.round(activeContextWindow.usedPercentage)}%`
+                      : formatContextWindowTokens(activeContextWindow.usedTokens)}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="inline-flex shrink-0 items-center gap-1 rounded-md border px-2 py-1 text-[11px] font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
+                  disabled={compactDisabled}
+                  title={compactDisabledReason ?? "Compact context (/compact)"}
+                  onClick={() => composerRef.current?.compactContext()}
+                >
+                  <Minimize2Icon className="size-3" aria-hidden="true" />
+                  Compact
+                </button>
+                <button
+                  type="button"
+                  className="inline-flex shrink-0 items-center gap-1 rounded-md border px-2 py-1 text-[11px] font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
+                  onClick={() => {
+                    const u = activeContextWindow;
+                    toastManager.add({
+                      type: "info",
+                      title: `Context ${u.usedPercentage !== null ? `${Math.round(u.usedPercentage)}%` : ""}`.trim(),
+                      description: `Used ${formatContextWindowTokens(u.usedTokens)}${u.maxTokens ? ` / ${formatContextWindowTokens(u.maxTokens)}` : ""}${u.totalProcessedTokens ? ` · total ${formatContextWindowTokens(u.totalProcessedTokens)}` : ""}${u.remainingTokens !== null ? ` · ${formatContextWindowTokens(u.remainingTokens)} remaining` : ""}`,
+                    });
+                  }}
+                  title="Show context details (/context)"
+                >
+                  Details
+                </button>
+              </div>
+            ) : null}
             {/* Messages Wrapper */}
             <div className="relative flex min-h-0 flex-1 flex-col">
               {/* Messages — LegendList handles virtualization and scrolling internally */}

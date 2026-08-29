@@ -1286,8 +1286,22 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         selectedProviderStatus?.skills ?? [],
         settings.showSkillsInSlashMenu,
       );
+      const syntheticContextCommands: ReadonlyArray<{ name: string; description: string }> =
+        [
+          { name: "context", description: "Show context window usage" },
+          { name: "compact", description: "Compact conversation context" },
+        ].filter(
+          (synthetic) =>
+            !(selectedProviderStatus?.slashCommands ?? []).some(
+              (c) => c.name.trim().toLowerCase() === synthetic.name,
+            ),
+        ) as ReadonlyArray<{ name: string; description: string }>;
+      const mergedSlashCommands = [
+        ...(selectedProviderStatus?.slashCommands ?? []),
+        ...syntheticContextCommands,
+      ];
       const providerSlashCommandItems = getProviderSlashCommandsForSlashMenu(
-        selectedProviderStatus?.slashCommands ?? [],
+        mergedSlashCommands,
         slashMenuSkills,
       ).map((command) => ({
         id: `provider-slash-command:${selectedProvider}:${command.name}`,
